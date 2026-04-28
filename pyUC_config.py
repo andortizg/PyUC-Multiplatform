@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-UC_VERSION = "1.0 Beta"
+UC_VERSION = "2.0.0"
 
 _SYS = platform.system()
 
@@ -144,11 +144,16 @@ class AppConfig:
     vox_delay:            int   = 50
 
     # ── AGC ───────────────────────────────────────────────────────────────────
-    agc_enable:           bool  = False
+    agc_enable:           bool  = False   # TX AGC
     agc_target:           int   = 4000
     agc_max_gain:         float = 8.0
     agc_attack:           float = 0.1
     agc_release:          float = 0.02
+    rx_agc_enable:        bool  = False   # RX AGC
+    rx_agc_target:        int   = 8000    # higher target = louder output
+    rx_agc_max_gain:      float = 6.0
+    rx_agc_attack:        float = 0.15
+    rx_agc_release:       float = 0.03
 
     # ── UI / display ──────────────────────────────────────────────────────────
     window_width:         int   = 800
@@ -284,6 +289,11 @@ def load_config(path: str) -> AppConfig:
         cfg.agc_max_gain = _g(cp, D, "agcMaxGain",  8.0,  float)
         cfg.agc_attack   = _g(cp, D, "agcAttack",   0.1,  float)
         cfg.agc_release  = _g(cp, D, "agcRelease",  0.02, float)
+        cfg.rx_agc_enable   = bool(_g(cp, D, "rxAgcEnable",  0,    int))
+        cfg.rx_agc_target   = _g(cp, D, "rxAgcTarget",   8000, int)
+        cfg.rx_agc_max_gain = _g(cp, D, "rxAgcMaxGain",  6.0,  float)
+        cfg.rx_agc_attack   = _g(cp, D, "rxAgcAttack",   0.15, float)
+        cfg.rx_agc_release  = _g(cp, D, "rxAgcRelease",  0.03, float)
 
         # UI
         cfg.window_width    = _g(cp, D, "windowWidth",       800, int)
@@ -407,6 +417,7 @@ def save_config(path: str, cfg: AppConfig) -> bool:
             "voxThreshold":      str(cfg.vox_threshold),
             "voxDelay":          str(cfg.vox_delay),
             "agcEnable":         "1" if cfg.agc_enable else "0",
+            "rxAgcEnable":       "1" if cfg.rx_agc_enable else "0",
             "gpioPttPin":        str(cfg.gpio_ptt_pin),
             "gpioPttActiveLow":  "1" if cfg.gpio_ptt_active_low else "0",
             "spacebarPtt":       "1" if cfg.spacebar_ptt else "0",

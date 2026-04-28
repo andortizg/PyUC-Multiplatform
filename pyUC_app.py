@@ -130,7 +130,9 @@ class USRPApp:
         # Background services
         self._user_db   = UserDB()
         self._hamqth    = HamQTHSession(cfg.ham_user, cfg.ham_pass)
-        self._qrz       = QRZPhotoFetcher(cfg.colors.qrzPhotoBg and 200 or 200, 134)
+        from pyUC_ui_ctk import Layout as _Layout
+        _lay = _Layout(cfg.screen_profile)
+        self._qrz = QRZPhotoFetcher(_lay.qrz_w, _lay.qrz_h)
         self._pistar    = PiStarUpdater()
         self._sysmon    = SysMonitor()
         self._gpio      = GPIOPtt(cfg.gpio_ptt_pin, cfg.gpio_ptt_active_low)

@@ -226,6 +226,8 @@ class USRPCore:
         self._tx_start     = 0.0
         self._current_mode = cfg.default_server
         self._current_tg   = ""
+        self._rx_agc_gain  = 1.0    # AGC gain state for RX path
+        self._tx_agc_gain  = 1.0    # AGC gain state for TX path
         self._no_quote     = {ord('"'): ''}
         self._file_md5     = None
 
@@ -454,6 +456,11 @@ class USRPCore:
         Sends a macro command to AB to switch protocol mode.
         :param mode: e.g. 'DMR', 'YSF', 'P25'
         """
+        if not self._tx_enable:
+            self._tx_enable = True
+            self._fire('transmit_enable', True)
+            self._fire('rx_end', '', '', '', 0.0, 0.0)
+            self._fire('audio_level', 0)
         self._current_mode = mode
         self.send_usrp_command(("*" + mode).encode('ASCII'), USRP_TYPE_DTMF)
 
@@ -559,6 +566,11 @@ class USRPCore:
         call = name = tg = rxslot = loss = ''
         last_seq = seq = 0
         rx_state = None
+        # Packet loss tracking
+        _rx_seq_first  = -1    # sequence number of first voice packet in current RX
+        _rx_seq_last   = -1    # sequence number of last voice packet received
+        _rx_pkt_rcv    = 0     # packets actually received this transmission
+        _rx_pkt_exp    = 0     # packets expected (last_seq - first_seq + 1)
 
         while not self._done:
             try:
@@ -581,28 +593,71 @@ class USRPCore:
                     if SAMPLE_RATE == 48000:
                         audio48, rx_state = audioop.ratecv(
                             payload, 2, 1, 8000, 48000, rx_state)
-                        # ── Spk volume (software gain on RX audio) ───────
+                        # ── Spk volume ───────────────────────────────────
                         spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
                         if spk_gain != 1.0:
                             audio48 = audioop.mul(audio48, 2, spk_gain)
+                        # ── RX AGC ───────────────────────────────────────
+                        if self.cfg.rx_agc_enable:
+                            rms_rx = audioop.rms(audio48, 2) or 1
+                            err = self.cfg.rx_agc_target / rms_rx
+                            if err > 1:
+                                self._rx_agc_gain += self.cfg.rx_agc_attack  * (err - 1)
+                            else:
+                                self._rx_agc_gain += self.cfg.rx_agc_release * (err - 1)
+                            self._rx_agc_gain = max(1.0, min(
+                                self._rx_agc_gain, self.cfg.rx_agc_max_gain))
+                            audio48 = audioop.mul(audio48, 2, self._rx_agc_gain)
                         out_stream.write(bytes(audio48), CHUNK)
                     else:
                         spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
                         payload_out = audioop.mul(payload, 2, spk_gain) if spk_gain != 1.0 else payload
+                        if self.cfg.rx_agc_enable:
+                            rms_rx = audioop.rms(payload_out, 2) or 1
+                            err = self.cfg.rx_agc_target / rms_rx
+                            if err > 1:
+                                self._rx_agc_gain += self.cfg.rx_agc_attack  * (err - 1)
+                            else:
+                                self._rx_agc_gain += self.cfg.rx_agc_release * (err - 1)
+                            self._rx_agc_gain = max(1.0, min(
+                                self._rx_agc_gain, self.cfg.rx_agc_max_gain))
+                            payload_out = audioop.mul(payload_out, 2, self._rx_agc_gain)
                         out_stream.write(payload_out, CHUNK)
                     if (seq % self.cfg.level_every_sample) == 0:
                         rms = audioop.rms(payload, 2)
                         self._fire('audio_level', int(rms / 100))
 
+                    # ── Packet loss tracking ──────────────────────────────
+                    if keyup:
+                        if _rx_seq_first == -1:
+                            _rx_seq_first = seq
+                            _rx_pkt_rcv   = 1
+                        else:
+                            _rx_pkt_rcv += 1
+                        _rx_seq_last = seq
+
                 if keyup != last_key:
                     if keyup:
-                        start_time = time()
+                        start_time    = time()
+                        _rx_seq_first = -1
+                        _rx_seq_last  = -1
+                        _rx_pkt_rcv   = 0
                     else:
+                        # Calculate packet loss from sequence gaps
+                        if _rx_seq_first >= 0 and _rx_seq_last > _rx_seq_first:
+                            _rx_pkt_exp = _rx_seq_last - _rx_seq_first + 1
+                            lost        = max(0, _rx_pkt_exp - _rx_pkt_rcv)
+                            loss        = f'{lost / _rx_pkt_exp * 100:.1f}%'
+                        else:
+                            loss = '0.0%'
                         self._fire('rx_end', call, tg, loss,
                                    time() - start_time, start_time)
                         self._tx_enable = True
                         self._fire('transmit_enable', True)
                         self._fire('audio_level', 0)
+                        # Reset for next transmission
+                        _rx_seq_first = -1
+                        loss          = ''
                     last_key = keyup
 
             # ---- Text / protocol messages ------------------------------
@@ -638,24 +693,34 @@ class USRPCore:
                         self.macros = macs
                         if body[:6] == "MACRO:":
                             self._fire('macro_received', macs)
-                    else:
-                        try:
-                            obj  = json.loads(body)
-                            mode = obj["tlv"]["ambe_mode"]
-                            new_mode = "YSF" if mode[:3] == "YSF" else mode
-                            self._current_mode = new_mode
-                            self._fire('mode_change', new_mode,
-                                       obj.get("last_tune", ""))
-                        except Exception as exc:
-                            logging.warning("INFO JSON parse error: %s", exc)
-
+                        else:
+                            try:
+                                obj  = json.loads(body)
+                                mode = obj["tlv"]["ambe_mode"]
+                                new_mode = "YSF" if mode[:3] == "YSF" else mode
+                                if new_mode != self._current_mode and not self._tx_enable:
+                                    self._tx_enable = True
+                                    self._fire('transmit_enable', True)
+                                    self._fire('rx_end', '', '', '', 0.0, 0.0)
+                                    self._fire('audio_level', 0)
+                                self._current_mode = new_mode
+                                self._fire('mode_change', new_mode,
+                                           obj.get("last_tune", ""))
+                            except Exception as exc:
+                                logging.warning("INFO JSON parse error: %s", exc)
                 else:
                     # TLV embedded in TEXT payload
                     if payload[0] == TLV_TAG_SET_INFO:
                         if not self._tx_enable:
                             # Missed EOT – close previous transmission
+                            if _rx_seq_first >= 0 and _rx_seq_last > _rx_seq_first:
+                                _rx_pkt_exp = _rx_seq_last - _rx_seq_first + 1
+                                lost        = max(0, _rx_pkt_exp - _rx_pkt_rcv)
+                                loss        = f'{lost / _rx_pkt_exp * 100:.1f}%'
                             self._fire('rx_end', call, tg, loss,
                                        time() - start_time, start_time)
+                            _rx_seq_first = -1
+                            loss          = ''
 
                         rid    = (payload[2] << 16) | (payload[3] << 8) | payload[4]
                         tg_num = (payload[9] << 16) | (payload[10] << 8) | payload[11]
@@ -708,10 +773,16 @@ class USRPCore:
                 if not self._tx_enable:
                     if (last_seq + 1) == seq:
                         logging.info("missed EOT")
+                        if _rx_seq_first >= 0 and _rx_seq_last > _rx_seq_first:
+                            _rx_pkt_exp = _rx_seq_last - _rx_seq_first + 1
+                            lost        = max(0, _rx_pkt_exp - _rx_pkt_rcv)
+                            loss        = f'{lost / _rx_pkt_exp * 100:.1f}%'
                         self._fire('rx_end', call, tg, loss,
                                    time() - start_time, start_time)
                         self._tx_enable = True
                         self._fire('transmit_enable', True)
+                        _rx_seq_first = -1
+                        loss          = ''
                     last_seq = seq
 
             # ---- TLV ---------------------------------------------------
@@ -757,6 +828,18 @@ class USRPCore:
                 mic_gain = max(0, min(self.cfg.mic_vol, 100)) / 100.0
                 if mic_gain != 1.0:
                     audio = audioop.mul(audio, 2, mic_gain)
+
+                # ── TX AGC ────────────────────────────────────────────────
+                if self.cfg.agc_enable:
+                    rms_tx = audioop.rms(audio, 2) or 1
+                    err = self.cfg.agc_target / rms_tx
+                    if err > 1:
+                        self._tx_agc_gain += self.cfg.agc_attack  * (err - 1)
+                    else:
+                        self._tx_agc_gain += self.cfg.agc_release * (err - 1)
+                    self._tx_agc_gain = max(1.0, min(
+                        self._tx_agc_gain, self.cfg.agc_max_gain))
+                    audio = audioop.mul(audio, 2, self._tx_agc_gain)
 
                 # ---- VOX -------------------------------------------
                 if self.vox_enable:

@@ -79,8 +79,6 @@ class Layout:
         self.tab_padx  = 14 if pc else (10 if rpi5 else 7)
 
         self.meter_h = 12 if pc else (10 if rpi5 else 8)
-        self._vu_cv = self._rx_cv = self._tx_cv = None  # _vu_cv es el único real
-        self._loss_lbl = None
 
         self._reg_lbl = None
         
@@ -224,8 +222,14 @@ class CtkUI(UIAdapter):
             setattr(self.app.core, 'vox_threshold', self.v_vox_th.get()))
         self.v_vox_dl.trace('w', lambda *_: self.app and
             setattr(self.app.core, 'vox_delay',     self.v_vox_dl.get()))
-        self.v_slot.trace('w',   lambda *_: self.app and
-            setattr(self.app.core, 'slot',          self.v_slot.get()))
+        # _v_ts_str drives the TS dropdown ('TS1'/'TS2') → v_slot IntVar → core.slot
+        self._v_ts_str = StringVar(value=f'TS{cfg.slot}')
+        def _ts_trace(*_):
+            val = 1 if self._v_ts_str.get() == 'TS1' else 2
+            self.v_slot.set(val)
+            if self.app:
+                self.app.core.slot = val
+        self._v_ts_str.trace('w', _ts_trace)
         self.v_mic_vol.trace('w', lambda *_: self.app and
             setattr(self.app.core.cfg, 'mic_vol',   self.v_mic_vol.get()))
         self.v_spk_vol.trace('w', lambda *_: self.app and
@@ -233,13 +237,15 @@ class CtkUI(UIAdapter):
 
         # Widget refs (populated by _build)
         self.listbox = self.ptt_btn = self.log_tv  = None
-        self.qrz_lbl = self._rx_cv = self._tx_cv  = None
+        self.qrz_lbl = self._vu_cv = None
         self._mode_btns = self._tab_frms = self._tab_btns = None
         self._filt_btns = {}
         self._sv = {}
         self._status_v = self._tgconn_v = None
         self._status_lbl = self._tgconn_lbl = None
         self.on_air_lbl  = None
+        self._v_manual_tg = None   # populated by _mk_right
+        self._v_gp        = None   # 'G' | 'P'
 
         # HamQTH vars — used in settings
         self._v_ham_user      = StringVar(value=cfg.ham_user)
@@ -436,8 +442,10 @@ class CtkUI(UIAdapter):
         call_row = Frame(inf, bg=T.surface2Color)
         call_row.pack(fill=X, anchor=W)
         # ON AIR pinned to the right edge — packed first so it's never pushed out
+        # Font scaled by profile: cs font -4 avoids overflow on rpi5 (148 px wide photo)
+        _onair_fs = max(14, L.f_cs - 4)
         self.on_air_lbl = Label(call_row, text='● ON AIR',
-                                font=(L.font_family, 26, 'bold'),
+                                font=(L.font_family, _onair_fs, 'bold'),
                                 fg=T.surface2Color, bg=T.surface2Color)
         self.on_air_lbl.pack(side=RIGHT, padx=(4, 4), pady=(5, 0))
         Label(call_row, textvariable=self.v_call,
@@ -465,7 +473,6 @@ class CtkUI(UIAdapter):
                                  fg=T.redColor, bg=T.surface2Color, anchor=E)
         self._status_lbl.pack(side=RIGHT, padx=(4, 0))
 
-    
         if compact:
             return
 
@@ -524,7 +531,7 @@ class CtkUI(UIAdapter):
                   fg=T.textMuted, bg=T.bgColor).pack(anchor=W, pady=(0, 2))
             fr = Frame(col, bg=T.bgColor)
             fr.pack(fill=X, pady=(0, 3))
-            sizes = {'all': 36, 'favs': 0, 'pistar': 60}  # 0 = expand
+            sizes = {'all': 36, 'favs': 0, 'pistar': 60}
             for tag, txt in [('all', 'ALL'), ('favs', 'FAVS ★'), ('pistar', 'PI-STAR')]:
                 w = sizes[tag]
                 b = _ctk_btn(fr, txt, T.surface2Color, T.textPrimary,
@@ -545,17 +552,19 @@ class CtkUI(UIAdapter):
                      ).pack(side=LEFT, padx=(4, 2))
             self._set_filt('all')
 
+        # Listbox — slightly shorter to make room for the manual entry row
         lf = Frame(col, bg=T.bgColor)
         lf.pack(fill=BOTH, expand=True)
         self.listbox = Listbox(lf, font=(None, L.f),
-                               bg=T.surface2Color, fg=T.textPrimary,
-                               selectbackground=T.tgSelectedBg,
-                               selectforeground=T.accentColor,
-                               activestyle='none',
-                               relief=FLAT, bd=0,
-                               highlightbackground=T.borderColor,
-                               highlightthickness=1,
-                               exportselection=False)
+                       bg=T.surface2Color, fg=T.textPrimary,
+                       selectbackground=T.tgSelectedBg,
+                       selectforeground=T.accentColor,
+                       activestyle='none',
+                       relief=FLAT, bd=0,
+                       highlightbackground=T.borderColor,
+                       highlightthickness=1,
+                       height=6,
+                       exportselection=False)
         sb = Scrollbar(lf, orient=VERTICAL, command=self.listbox.yview)
         self.listbox.configure(yscrollcommand=sb.set)
         self.listbox.pack(side=LEFT, fill=BOTH, expand=True)
@@ -563,22 +572,73 @@ class CtkUI(UIAdapter):
         self.listbox.bind('<Double-Button-1>', lambda _: self._connect())
         self._fill_tg(self.cfg.default_server)
 
+        # ── Manual TG entry + G/P dropdown ───────────────────────────────────
+        me = Frame(col, bg=T.bgColor)
+        me.pack(fill=X, pady=(3, 0))
+        self._v_manual_tg = StringVar()
+        ctk.CTkEntry(
+                    me,
+                    textvariable=self._v_manual_tg,
+                    placeholder_text='TG / Reflector',
+                    fg_color=T.entryBgColor,
+                    text_color=T.textPrimary,
+                    border_color=T.borderColor,
+                    border_width=1,
+                    font=(None, L.f_sm),
+                    height=26,
+                    width=100  # 
+                ).pack(side=LEFT, padx=(0, 1))
+        # G/P dropdown — only meaningful in DMR, right-aligned
+        self._v_gp = StringVar(value='G')
+        ctk.CTkOptionMenu(me,
+                          variable=self._v_gp,
+                          values=['G', 'P'],
+                          fg_color=T.buttonBgColor,
+                          text_color=T.textPrimary,
+                          button_color=T.buttonBgColor,
+                          button_hover_color=T.tgSelectedBg,
+                          dropdown_fg_color=T.surfaceColor,
+                          dropdown_text_color=T.textPrimary,
+                          font=(None, L.f_sm, 'bold'),
+                          dropdown_font=(None, L.f_sm),
+                          width=52, height=26,
+                          ).pack(side=RIGHT)
+
+        # ── CONNECT button ────────────────────────────────────────────────────
         br = Frame(col, bg=T.bgColor)
         br.pack(fill=X, pady=(4, 0))
         _ctk_btn(br, 'CONNECT', T.connectBtnBg, T.accentColor,
                  T.connectBtnHover, self._connect,
                  border_col=T.accentColor, border_w=2,
                  font=(None, L.f_sm, 'bold'), height=28
-                 ).pack(side=LEFT, fill=X, expand=True)
-       
+                 ).pack(fill=X)
 
-        # Connected TG name below CONNECT (replaces the old status card)
-        self._tgconn_v = StringVar(value='Disconnected')
-        Label(col, textvariable=self._tgconn_v,
-              font=(None, L.f_sm, 'bold'),
-              fg=T.accent2Color, bg=T.bgColor,
-              anchor=W, wraplength=L.tg_col_w - 10 if L.tg_col_w else 160
-              ).pack(fill=X, pady=(2, 0))
+        # ── Connected TG name + TS dropdown on the same line ─────────────────
+        ts_row = Frame(col, bg=T.bgColor)
+        ts_row.pack(fill=X, pady=(3, 0))
+        self._tgconn_v = StringVar(value='DISC')
+        ent = Entry(ts_row, textvariable=self._tgconn_v,
+            font=(None, L.f_sm, 'bold'),
+            fg=T.accent2Color, bg=T.surface2Color,
+            readonlybackground=T.surface2Color,
+            relief=FLAT, bd=0, width=12,
+            state='readonly',
+            highlightthickness=0)
+        ent.pack(side=LEFT, padx=(0, 4))
+        # TS1/TS2 dropdown — right-aligned
+        ctk.CTkOptionMenu(ts_row,
+                          variable=self._v_ts_str,
+                          values=['TS1', 'TS2'],
+                          fg_color=T.buttonBgColor,
+                          text_color=T.textPrimary,
+                          button_color=T.buttonBgColor,
+                          button_hover_color=T.tgSelectedBg,
+                          dropdown_fg_color=T.surfaceColor,
+                          dropdown_text_color=T.textPrimary,
+                          font=(None, L.f_sm, 'bold'),
+                          dropdown_font=(None, L.f_sm),
+                          width=62, height=26,
+                          ).pack(side=RIGHT)
 
     # ── Bottom bar ────────────────────────────────────────────────────────────
     def _mk_bottom(self, parent):
@@ -586,19 +646,20 @@ class CtkUI(UIAdapter):
         inn = Frame(parent, bg=T.surfaceColor)
         inn.pack(fill=BOTH, expand=True, padx=8, pady=4)
 
-        # Meters
+        # Single VU meter: green during RX, red during TX
         mr = Frame(inn, bg=T.surfaceColor)
         mr.pack(fill=X, pady=(0, 3))
         Label(mr, text='Level', font=(None, 10, 'bold'),
-            fg=T.textMuted, bg=T.surfaceColor, width=5).pack(side=LEFT)
+              fg=T.textMuted, bg=T.surfaceColor).pack(side=LEFT, padx=(0, 4))
         self._vu_cv = Canvas(mr, height=L.meter_h, bg=T.meterBgColor,
                              bd=0, highlightbackground=T.borderColor,
                              highlightthickness=1)
-        self._vu_cv.pack(side=LEFT, fill=X, expand=True, padx=(0, 6))
-        self._loss_lbl = Label(mr, textvariable=self.v_tx_stats,
-                               font=(None, L.f_sm), fg=T.warnColor,
-                               bg=T.surfaceColor, width=10, anchor=W)
-        self._loss_lbl.pack(side=LEFT)
+        self._vu_cv.pack(side=LEFT, fill=X, expand=True)
+        # Loss label to the right of the meter — updated via v_tx_stats
+        Label(mr, textvariable=self.v_tx_stats,
+              font=(None, L.f_sm, 'bold'),
+              fg=T.warnColor, bg=T.surfaceColor,
+              width=10, anchor=E).pack(side=LEFT, padx=(6, 0))
 
         # PTT button
         ptt_row = Frame(inn, bg=T.surfaceColor)
@@ -637,6 +698,7 @@ class CtkUI(UIAdapter):
         sv['sub_id']   = StringVar(value=str(self.cfg.subscriber_id))
         sv['rep_id']   = StringVar(value=str(self.cfg.repeater_id))
         sv['agc']      = IntVar(value=int(self.cfg.agc_enable))
+        sv['rx_agc']   = IntVar(value=int(getattr(self.cfg, 'rx_agc_enable', False)))
         sv['gpio']     = StringVar(value=str(self.cfg.gpio_ptt_pin))
         sv['gpio_al']  = IntVar(value=int(self.cfg.gpio_ptt_active_low))
         sv['spc']      = IntVar(value=int(self.cfg.spacebar_ptt))
@@ -807,10 +869,11 @@ class CtkUI(UIAdapter):
         vol_slider(g, 'Mic volume', sv['mic'], 2, 2)
         row(g, 'Output device', sv['out_dev'], 3, 0, w=16, sel=True, opts=out_d)
         vol_slider(g, 'Spk volume', sv['spk'], 3, 2)
-        chk(g, 'AGC — auto gain control on TX', sv['agc'],     4, c=0, span=2)
-        chk(g, 'VOX — voice-operated PTT',      self.v_vox_en, 4, c=2, span=2)
-        row(g, 'VOX threshold', self.v_vox_th, 5, 0, w=6)
-        row(g, 'VOX delay',     self.v_vox_dl, 5, 2, w=6)
+        chk(g, 'AGC TX — auto gain control',    sv['agc'],     4, c=0, span=2)
+        chk(g, 'AGC RX — auto gain on receive', sv['rx_agc'],  4, c=2, span=2)
+        chk(g, 'VOX — voice-operated PTT',      self.v_vox_en, 5, c=0, span=2)
+        row(g, 'VOX threshold', self.v_vox_th, 6, 0, w=6)
+        row(g, 'VOX delay',     self.v_vox_dl, 6, 2, w=6)
         self._set_frms['audio'] = pg
 
         # ── Sub-page: GPIO ────────────────────────────────────────────────────
@@ -997,7 +1060,6 @@ class CtkUI(UIAdapter):
                 text_color=T.pttIdleFg,
                 border_color=T.pttIdleFg)
             self.v_tx_stats.set('Loss: —')
-            self._meter(self._vu_cv, 0, T.redColor)
             self._tx_level = 0
             self._set_on_air(False)
 
@@ -1007,6 +1069,7 @@ class CtkUI(UIAdapter):
         :param mode:    new mode
         :param last_tg: dial string to pre-select
         """
+        self._set_on_air(False)   # cancel any running ON AIR animation
         self._upd_mode_btn(mode)
         self._fill_tg(mode)
         if last_tg:
@@ -1023,7 +1086,7 @@ class CtkUI(UIAdapter):
     def show_disconnected(self):
         """Clear connected-TG status card."""
         if self._tgconn_v:
-            self._tgconn_v.set('Disconnected')
+            self._tgconn_v.set('DISC')
 
     def show_photo(self, call: str, photo, name: str, grid: str, city: str):
         """
@@ -1035,6 +1098,11 @@ class CtkUI(UIAdapter):
         :param grid:  Maidenhead locator
         :param city:  city/country string
         """
+        # For own callsign: use cfg.my_locator if HamQTH returned nothing
+        if call.upper() == self.cfg.my_call.upper():
+            if not grid and self.cfg.my_locator:
+                grid = self.cfg.my_locator
+
         # Cancel any pending revert when a new station is received
         if call.upper() != self.cfg.my_call.upper():
             if self._own_data_timer:
@@ -1059,7 +1127,9 @@ class CtkUI(UIAdapter):
         if not self.qrz_lbl:
             return
         if photo and PIL_OK:
-            tk_img = ImageTk.PhotoImage(photo)
+            # Force exact frame size — thumbnail only shrinks, resize handles both
+            photo_fit = photo.resize((self.L.qrz_w, self.L.qrz_h), Image.LANCZOS)
+            tk_img = ImageTk.PhotoImage(photo_fit)
             self.qrz_lbl.configure(image=tk_img, text='')
             self.qrz_lbl.image = tk_img
         else:
@@ -1216,9 +1286,13 @@ class CtkUI(UIAdapter):
     # ══════════════════════════════════════════════════════════════════════════
     def _pump(self):
         """Dispatches app IPC queue and updates meters."""
-        if self.app:
-            self.app.pump()
+        try:
+            if self.app:
+                self.app.pump()
+        except Exception as exc:
+            logging.error("pump error: %s", exc, exc_info=True)
 
+        # Single VU meter: red during TX (real mic level), green during RX
         if self._tx_active:
             self._meter(self._vu_cv, self._tx_level, self.T.redColor)
         else:
@@ -1262,10 +1336,13 @@ class CtkUI(UIAdapter):
             self._onair_after_id = None
             self._animate_onair(0.0)
         elif self.on_air_lbl:
-            # Stop: hide the label by blending it into the background
             self._is_transmitting = False
-            if self.on_air_lbl:
-                self.on_air_lbl.configure(fg=self.T.surface2Color)
+            # Cancel any pending after() so animation stops immediately
+            if self._onair_after_id:
+                try: self.root.after_cancel(self._onair_after_id)
+                except Exception: pass
+                self._onair_after_id = None
+            self.on_air_lbl.configure(fg=self.T.surface2Color)
 
     def _animate_onair(self, phase: float):
         """
@@ -1315,14 +1392,6 @@ class CtkUI(UIAdapter):
     # ══════════════════════════════════════════════════════════════════════════
     # TG list helpers
     # ══════════════════════════════════════════════════════════════════════════
-    def _resolve_tg(self, tg: str) -> str:
-        """Resolves a dial string to its display name from talk_groups."""
-        mode = self.v_mode.get()
-        for name, dial in self.cfg.talk_groups.get(mode, []):
-            if dial == tg:
-                return name
-        return tg   # fallback: show raw value if not found
-
     def _fill_tg(self, mode: str):
         """Reload listbox with visible TGs for the given mode."""
         if not self.listbox:
@@ -1412,10 +1481,29 @@ class CtkUI(UIAdapter):
     # Connect / PTT
     # ══════════════════════════════════════════════════════════════════════════
     def _connect(self):
-        """Connect to the currently selected TG."""
+        """
+        Connect to a talk group.
+        Priority: manual entry > listbox selection.
+        In DMR, appends '#' for private calls (P).
+        """
         if not self.app:
             return
-        dial, name = self._cur_tg()
+        manual = self._v_manual_tg.get().strip() if self._v_manual_tg else ''
+        if manual:
+            dial = manual
+            name = manual
+            self._v_manual_tg.set('')
+        else:
+            dial, name = self._cur_tg()
+    
+        # Añadir sufijo '#' para llamadas privadas DMR
+        if dial and not dial.startswith('*'):
+            if (self._v_gp and self._v_gp.get() == 'P'
+                    and self.v_mode.get() == 'DMR'
+                    and not dial.endswith('#')):
+                dial = dial + '#'
+                name = name + ' (P)'
+    
         if dial:
             self.app.connect(dial, name)
 
@@ -1440,7 +1528,7 @@ class CtkUI(UIAdapter):
             return
         self.log_tv.insert('', END, values=(
             call.strip()[:9], strftime('%H:%M:%S', localtime()),
-            self._resolve_tg(tg)[:20], f'{dur:.1f}s', loss or '0.0%'))
+            tg[:18], f'{dur:.1f}s', loss or '0.00%'))
         self.root.after(200, lambda: self.log_tv.yview_moveto(1))
 
     def _style_tv(self):
@@ -1552,6 +1640,8 @@ class CtkUI(UIAdapter):
         self.cfg.gpio_ptt_pin        = int(sv['gpio'].get())
         self.cfg.gpio_ptt_active_low = bool(sv['gpio_al'].get())
         self.cfg.agc_enable          = bool(sv['agc'].get())
+        if hasattr(self.cfg, 'rx_agc_enable'):
+            self.cfg.rx_agc_enable   = bool(sv['rx_agc'].get())
         self.cfg.mic_vol             = sv['mic'].get()
         self.cfg.spk_vol             = sv['spk'].get()
         self.cfg.ham_user            = self._v_ham_user.get().strip()

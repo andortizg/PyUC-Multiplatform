@@ -14,6 +14,7 @@ from time    import localtime, strftime
 from pathlib import Path
 import logging, webbrowser, math, subprocess
 import platform as _platform
+from time import localtime, strftime, time
 
 try:
     from PIL import Image, ImageTk
@@ -82,6 +83,11 @@ class Layout:
 
         self._reg_lbl = None
         
+        # Timer 
+        self._timer_running = False
+        self._timer_start = 0.0
+        self._timer_after_id = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -178,7 +184,11 @@ class CtkUI(UIAdapter):
         self._toast_win       = None
         self._own_data        = None   # (call, photo, name, grid, city) for own callsign
         self._own_data_timer  = None   # after() id for revert-to-own-data
+        self._timer_running = False
+        self._timer_start = 0.0
+        self._timer_after_id = None
 
+        
         # CTk root
         ctk.set_appearance_mode(cfg.theme_mode if cfg.theme_mode in ('dark', 'light') else 'dark')
         ctk.set_default_color_theme('dark-blue')
@@ -214,6 +224,18 @@ class CtkUI(UIAdapter):
         self.v_vox_dl   = IntVar(value=cfg.vox_delay)
         self.v_mic_vol  = IntVar(value=int(cfg.mic_vol))
         self.v_spk_vol  = IntVar(value=int(cfg.spk_vol))
+        self.v_timer = StringVar(value='')
+
+
+        self._tgconn_full_text = ''       # texto completo del TG conectado
+        self._marquee_pos = 0             # posición actual de la marquesina
+        self._marquee_id = None           # id del after() para cancelarlo
+        self._tgconn_full = 'DISC'
+        self._tgconn_offset = 0
+        self._tgconn_scrolling = False
+        self._tgconn_anim_id = None      
+        self._tgconn_lbl = None
+        
 
         # Traces → propagate to core when app is ready
         self.v_vox_en.trace('w', lambda *_: self.app and
@@ -303,7 +325,7 @@ class CtkUI(UIAdapter):
         self._reg_lbl = Label(bar, text='Not registered',
                       font=(None, L.f_sm, 'bold'),
                       fg=T.redColor, bg=T.surfaceColor)
-        self._reg_lbl.pack(side=LEFT, padx=(0, 8))
+        self._reg_lbl.pack(side=LEFT, padx=(0, 22))
 
 
         Frame(self.root, bg=T.borderColor, height=1).pack(fill=X)
@@ -354,7 +376,30 @@ class CtkUI(UIAdapter):
         for k, b in self._tab_btns.items():
             if k in ('exit', 'shutdown'): continue
             b.configure(text_color=T.tabActiveFg if k == key else T.tabInactiveFg)
+    def _start_timer(self):
+        """Inicia el contador de tiempo."""
+        self._timer_start = time()
+        self._timer_running = True
+        self._tick_timer()
 
+    def _tick_timer(self):
+        """Actualiza el contador cada segundo."""
+        if not self._timer_running:
+            return
+        elapsed = int(time() - self._timer_start)
+        mins = elapsed // 60
+        secs = elapsed % 60
+        self.v_timer.set(f'{mins:02d}:{secs:02d}')
+        self._timer_after_id = self.root.after(1000, self._tick_timer)
+    
+    def _stop_timer(self):
+        """Para el contador de tiempo."""
+        self._timer_running = False
+        if self._timer_after_id:
+            self.root.after_cancel(self._timer_after_id)
+            self._timer_after_id = None
+        self.v_timer.set('')
+    
     # ══════════════════════════════════════════════════════════════════════════
     # Main tab
     # ══════════════════════════════════════════════════════════════════════════
@@ -458,9 +503,15 @@ class CtkUI(UIAdapter):
         Label(inf, textvariable=self.v_qth_info,
               font=(L.font_family, 18),
               fg=T.textSecondary, bg=T.surface2Color, anchor=W).pack(fill=X)
-        Label(inf, textvariable=self.v_loc_dist,
+        loc_row = Frame(inf, bg=T.surface2Color)
+        loc_row.pack(fill=X)
+        Label(loc_row, textvariable=self.v_loc_dist,
               font=(L.font_family, 18, 'bold'),
-              fg=T.accentColor, bg=T.surface2Color, anchor=W).pack(fill=X)
+              fg=T.accentColor, bg=T.surface2Color, anchor=W).pack(side=LEFT, fill=X, expand=True)
+        Label(loc_row, textvariable=self.v_timer,
+              font=(L.font_family, 18, 'bold'),
+              fg=T.greenColor, bg=T.surface2Color, anchor=E).pack(side=RIGHT, padx=(4, 0))
+                
         # minfo row: DMR ID / mode info (left) + status (right)
         minfo_row = Frame(inf, bg=T.surface2Color)
         minfo_row.pack(fill=X)
@@ -621,7 +672,7 @@ class CtkUI(UIAdapter):
             font=(None, L.f_sm, 'bold'),
             fg=T.accent2Color, bg=T.surface2Color,
             readonlybackground=T.surface2Color,
-            relief=FLAT, bd=0, width=12,
+            relief=FLAT, bd=0, width=10,
             state='readonly',
             highlightthickness=0)
         ent.pack(side=LEFT, padx=(0, 4))
@@ -637,7 +688,7 @@ class CtkUI(UIAdapter):
                           dropdown_text_color=T.textPrimary,
                           font=(None, L.f_sm, 'bold'),
                           dropdown_font=(None, L.f_sm),
-                          width=62, height=26,
+                          width=70, height=26,
                           ).pack(side=RIGHT)
 
     # ── Bottom bar ────────────────────────────────────────────────────────────
@@ -697,7 +748,6 @@ class CtkUI(UIAdapter):
         sv['call']     = StringVar(value=self.cfg.my_call)
         sv['sub_id']   = StringVar(value=str(self.cfg.subscriber_id))
         sv['rep_id']   = StringVar(value=str(self.cfg.repeater_id))
-        sv['agc']      = IntVar(value=int(self.cfg.agc_enable))
         sv['rx_agc']   = IntVar(value=int(getattr(self.cfg, 'rx_agc_enable', False)))
         sv['gpio']     = StringVar(value=str(self.cfg.gpio_ptt_pin))
         sv['gpio_al']  = IntVar(value=int(self.cfg.gpio_ptt_active_low))
@@ -869,9 +919,8 @@ class CtkUI(UIAdapter):
         vol_slider(g, 'Mic volume', sv['mic'], 2, 2)
         row(g, 'Output device', sv['out_dev'], 3, 0, w=16, sel=True, opts=out_d)
         vol_slider(g, 'Spk volume', sv['spk'], 3, 2)
-        chk(g, 'AGC TX — auto gain control',    sv['agc'],     4, c=0, span=2)
-        chk(g, 'AGC RX — auto gain on receive', sv['rx_agc'],  4, c=2, span=2)
-        chk(g, 'VOX — voice-operated PTT',      self.v_vox_en, 5, c=0, span=2)
+        chk(g, 'AGC RX', sv['rx_agc'],  4, c=0, span=2)
+        chk(g, 'VOX',      self.v_vox_en, 5, c=0, span=2)
         row(g, 'VOX threshold', self.v_vox_th, 6, 0, w=6)
         row(g, 'VOX delay',     self.v_vox_dl, 6, 2, w=6)
         self._set_frms['audio'] = pg
@@ -1003,6 +1052,7 @@ class CtkUI(UIAdapter):
         else:
             self.v_minfo.set(f'{current_mode} · TS{slot} · {mode}')
         self._set_on_air(True)
+        self._start_timer()   # Timer
 
     def show_rx_end(self, call: str, tg: str, loss: str, duration: float):
         """
@@ -1014,6 +1064,7 @@ class CtkUI(UIAdapter):
         """
         self._log_add(call, tg, duration, loss)
         self._set_on_air(False)
+        self._stop_timer()    # Timer
 
         # Show loss in the QRZ stats label, revert to — after 8 s
         if loss and loss != '0.0%':
@@ -1021,6 +1072,7 @@ class CtkUI(UIAdapter):
             self.root.after(8000, lambda: self.v_tx_stats.set('Loss: —'))
         else:
             self.v_tx_stats.set('Loss: —')
+            
 
         # Revert to own data after timeout
         if getattr(self.cfg, 'own_data_timeout', 30) > 0 and self._own_data:
@@ -1051,6 +1103,7 @@ class CtkUI(UIAdapter):
                 fg_color=T.pttActiveBg,
                 text_color=T.pttActiveFg,
                 border_color=T.pttActiveFg)
+            self._start_timer()
             self.v_tx_stats.set('Loss: —')
             self._set_on_air(True)
         else:
@@ -1062,6 +1115,7 @@ class CtkUI(UIAdapter):
             self.v_tx_stats.set('Loss: —')
             self._tx_level = 0
             self._set_on_air(False)
+            self._stop_timer()    # 
 
     def show_mode(self, mode: str, last_tg: str):
         """
@@ -1069,24 +1123,95 @@ class CtkUI(UIAdapter):
         :param mode:    new mode
         :param last_tg: dial string to pre-select
         """
-        self._set_on_air(False)   # cancel any running ON AIR animation
-        self._upd_mode_btn(mode)
-        self._fill_tg(mode)
+        self._set_on_air(False)
+        self._upd_mode_btn(mode.upper())
+        self._fill_tg(mode.upper())
         if last_tg:
             self._sel_tg_val(last_tg)
+            # Buscar nombre amigable del TG y mostrarlo
+            tg_name = last_tg
+            for name, dial in self.cfg.talk_groups.get(mode.upper(), []):
+                if dial == last_tg:
+                    tg_name = name
+                    break
+            self._tgconn_full = tg_name
+            self._stop_scroll()
+            if self._tgconn_v:
+                self._tgconn_v.set(tg_name)
+            self.root.after(500, self._start_scroll)
+            
+    def _marquee_tg(self):
+        """Desplaza el texto del TG conectado en bucle."""
+        if not self._tgconn_v:
+            return
+        full = self._tgconn_full_text
+        # Si el texto es corto, lo mostramos estático
+        if len(full) <= 12:
+            self._tgconn_v.set(full)
+            self._marquee_id = None
+            return
+        # Añadir separador al final del texto original para el bucle
+        padded = full + '   ' + full
+        visible = padded[self._marquee_pos:self._marquee_pos + 12]
+        self._tgconn_v.set(visible)
+        self._marquee_pos = (self._marquee_pos + 1) % (len(full) + 3)
+        self._marquee_id = self.root.after(350, self._marquee_tg)
+    
+    def _start_scroll(self):
+        """Inicia el scroll animado si el texto no cabe."""
+        if not self._tgconn_lbl:
+            return
+        if self._tgconn_scrolling:
+            return
+        texto = self._tgconn_full
+        lbl = self._tgconn_lbl
+        lbl.update_idletasks()
+        if lbl.winfo_width() > 1 and lbl.winfo_reqwidth() > lbl.winfo_width():
+            self._tgconn_scrolling = True
+            self._tgconn_offset = 0
+            doble = '   '.join([texto] * 3)
+            self._tgconn_anim_id = self.root.after(
+                500, lambda: self._animate_scroll(doble))
 
+    def _stop_scroll(self):
+        """Detiene la animación de scroll."""
+        self._tgconn_scrolling = False
+        if self._tgconn_anim_id:
+            self.root.after_cancel(self._tgconn_anim_id)
+            self._tgconn_anim_id = None
+
+    def _animate_scroll(self, texto_doble):
+        """Desplaza el texto carácter a carácter."""
+        if not self._tgconn_lbl:
+            return
+        if not self._tgconn_scrolling:
+            return
+        offset = self._tgconn_offset
+        visible = texto_doble[offset:offset + 14]
+        self._tgconn_v.set(visible)
+        self._tgconn_offset = (offset + 1) % (len(texto_doble) // 3)
+        self._tgconn_anim_id = self.root.after(
+            250, lambda: self._animate_scroll(texto_doble))
+        
     def show_connected(self, tg_name: str):
         """
-        Update connected-TG status card.
+        Update connected-TG status card and start marquee.
         :param tg_name: friendly name
         """
+        self._tgconn_full = tg_name
+        self._stop_scroll()
         if self._tgconn_v:
             self._tgconn_v.set(tg_name)
+        self.root.after(500, self._start_scroll)
 
     def show_disconnected(self):
-        """Clear connected-TG status card."""
+        """Clear connected-TG status card and stop marquee."""
+
+        self._stop_scroll()
+        self._tgconn_full = 'DISC'
         if self._tgconn_v:
             self._tgconn_v.set('DISC')
+            
 
     def show_photo(self, call: str, photo, name: str, grid: str, city: str):
         """
@@ -1639,7 +1764,6 @@ class CtkUI(UIAdapter):
         self.cfg.spacebar_ptt        = bool(sv['spc'].get())
         self.cfg.gpio_ptt_pin        = int(sv['gpio'].get())
         self.cfg.gpio_ptt_active_low = bool(sv['gpio_al'].get())
-        self.cfg.agc_enable          = bool(sv['agc'].get())
         if hasattr(self.cfg, 'rx_agc_enable'):
             self.cfg.rx_agc_enable   = bool(sv['rx_agc'].get())
         self.cfg.mic_vol             = sv['mic'].get()

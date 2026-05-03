@@ -11,6 +11,8 @@ import struct
 import threading
 import queue
 import logging
+import math
+
 try:
     import audioop
 except ImportError:          # Python 3.13+ — audioop removed from stdlib
@@ -61,6 +63,27 @@ TLV_TAG_FILE_XFER = 11
 # Native pyaudio sample rate; downsampled to 8 kHz for USRP
 SAMPLE_RATE = 48000
 
+# Audio buffer size: número de paquetes a acumular antes de procesar
+# 0 = procesar paquete a paquete (PC rápido)
+# 2-4 = recomendado para Raspberry Pi
+RX_BUFFER_PACKETS = 3
+
+# ---------------------------------------------------------------------------
+# Soft clip parameters 
+# ---------------------------------------------------------------------------
+SOFT_CLIP_THRESHOLD = 25000    # absolute velue threshold (0-32767)
+SOFT_CLIP_RATIO     = 0.25     # soft clipping factor:
+                               #   0.0 = hard clip
+                               #   0.25 = smooth (recommended)
+                               #   0.5 = medium
+                               #   1.0 = turn off soft clipping
+
+# ---------------------------------------------------------------------------
+# AGC RX — parámetros de suavizado
+# ---------------------------------------------------------------------------
+AGC_KNEE         = 0.5     # fracción del target donde empieza a comprimir
+AGC_KNEE_RATIO   = 5.0     # ratio de compresión por encima de la rodilla
+AGC_MAX_GAIN_STEP = 0.1   # cambio máximo de ganancia por iteración
 
 # ---------------------------------------------------------------------------
 # Configuration data class  (plain Python – no tkinter)
@@ -214,7 +237,8 @@ class USRPCore:
         self.vox_delay     = cfg.vox_delay
         self.talk_groups   = cfg.talk_groups   # {mode: [(name, dial), ...]}
         self.macros        = cfg.macros        # {dial: display}
-
+        self._force_rx_reset = False
+        
         # Private state
         self._udp          = None
         self._pyaudio      = None
@@ -461,6 +485,7 @@ class USRPCore:
             self._fire('transmit_enable', True)
             self._fire('rx_end', '', '', '', 0.0, 0.0)
             self._fire('audio_level', 0)
+        self._force_rx_reset = True   # ← nuevo
         self._current_mode = mode
         self.send_usrp_command(("*" + mode).encode('ASCII'), USRP_TYPE_DTMF)
 
@@ -485,7 +510,24 @@ class USRPCore:
             dis = tgs[0][1].translate(self._no_quote)
             self.set_remote_tg(dis)
         self._fire('disconnected')
-
+    
+    # -----------------------------------------------------------------------
+    # SOFT CLIPPING
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _soft_clip(data: bytes, threshold: int = SOFT_CLIP_THRESHOLD,
+                   ratio: float = SOFT_CLIP_RATIO) -> bytes:
+        if ratio >= 1.0:
+            return data
+        import array
+        samples = array.array('h', data)
+        for i, s in enumerate(samples):
+            if s > threshold:
+                samples[i] = int(threshold + (s - threshold) * ratio)
+            elif s < -threshold:
+                samples[i] = int(-threshold + (s + threshold) * ratio)
+        return samples.tobytes()
+    
     # -----------------------------------------------------------------------
     # PTT
     # -----------------------------------------------------------------------
@@ -550,83 +592,222 @@ class USRPCore:
         INFO    = b'INFO:'
         EXITING = b'EXITING'
         CHUNK   = 160 if SAMPLE_RATE == 8000 else 960
-
+    
         try:
             out_stream = self._pyaudio.open(
                 format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
-                output=True, frames_per_buffer=CHUNK,
+                output=True, frames_per_buffer=CHUNK * 4,
                 output_device_index=self.cfg.out_index)
+            self._rx_audio_buf = bytearray()
+            _rx_buf_size = 320 * RX_BUFFER_PACKETS if RX_BUFFER_PACKETS > 0 else 0
+    
         except Exception as exc:
             logging.critical("Cannot open output audio stream: %s", exc)
             self._fire('error', "Output audio stream open error")
             return
-
+    
         last_key = -1
         start_time = time()
         call = name = tg = rxslot = loss = ''
         last_seq = seq = 0
         rx_state = None
-        # Packet loss tracking
-        _rx_seq_first  = -1    # sequence number of first voice packet in current RX
-        _rx_seq_last   = -1    # sequence number of last voice packet received
-        _rx_pkt_rcv    = 0     # packets actually received this transmission
-        _rx_pkt_exp    = 0     # packets expected (last_seq - first_seq + 1)
-
+        _rx_seq_first  = -1
+        _rx_seq_last   = -1
+        _rx_pkt_rcv    = 0
+        _rx_pkt_exp    = 0
+    
+        last_rx_time = time()
+    
         while not self._done:
             try:
+                self._udp.settimeout(0.5)
                 raw, _ = self._udp.recvfrom(1024)
+                last_rx_time = time()
+            except socket.timeout:
+                if last_key == 1 and time() - last_rx_time > 3.0:
+                    logging.warning("RX timeout — forzando rx_end")
+                    if _rx_seq_first >= 0 and _rx_seq_last > _rx_seq_first:
+                        _rx_pkt_exp = _rx_seq_last - _rx_seq_first + 1
+                        lost_pkts = max(0, _rx_pkt_exp - _rx_pkt_rcv)
+                        loss = f'{lost_pkts / _rx_pkt_exp * 100:.1f}%' if _rx_pkt_exp > 0 else '0.0%'
+                    duration = time() - start_time
+                    if duration > 300:
+                        duration = 0.0
+                    self._fire('rx_end', call, tg, loss, duration, start_time)
+                    self._fire('transmit_enable', True)
+                    self._fire('audio_level', 0)
+                    self._tx_enable = True
+                    last_key = 0
+                    call = name = tg = rxslot = loss = ''
+                    self._rx_audio_buf = bytearray()
+                    _rx_seq_first = -1
+                continue
             except Exception:
                 continue
-
+    
+            # Reset forzado por cambio de modo
+            if self._force_rx_reset:
+                self._force_rx_reset = False
+                if last_key == 1:
+                    if _rx_seq_first >= 0 and _rx_seq_last > _rx_seq_first:
+                        _rx_pkt_exp = _rx_seq_last - _rx_seq_first + 1
+                        lost_pkts = max(0, _rx_pkt_exp - _rx_pkt_rcv)
+                        loss = f'{lost_pkts / _rx_pkt_exp * 100:.1f}%' if _rx_pkt_exp > 0 else '0.0%'
+                    duration = time() - start_time
+                    if duration > 300:
+                        duration = 0.0
+                    self._fire('rx_end', call, tg, loss, duration, start_time)
+                    self._fire('transmit_enable', True)
+                    self._fire('audio_level', 0)
+                self._tx_enable = True
+                last_key = -1
+                call = name = tg = rxslot = loss = ''
+                self._rx_audio_buf = bytearray()
+                _rx_seq_first = -1
+                continue
+    
             if raw[:4] != USRP:
                 continue
-
+    
             seq,       = struct.unpack(">i", raw[4:8])
             keyup,     = struct.unpack(">i", raw[12:16])
             talkgroup, = struct.unpack(">i", raw[16:20])
             pkt_type,  = struct.unpack("i",  raw[20:24])
             payload    = raw[32:]
-
+    
             # ---- Voice audio -------------------------------------------
             if pkt_type == USRP_TYPE_VOICE:
                 if len(payload) == 320:
-                    if SAMPLE_RATE == 48000:
-                        audio48, rx_state = audioop.ratecv(
-                            payload, 2, 1, 8000, 48000, rx_state)
-                        # ── Spk volume ───────────────────────────────────
-                        spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
-                        if spk_gain != 1.0:
-                            audio48 = audioop.mul(audio48, 2, spk_gain)
-                        # ── RX AGC ───────────────────────────────────────
-                        if self.cfg.rx_agc_enable:
-                            rms_rx = audioop.rms(audio48, 2) or 1
-                            err = self.cfg.rx_agc_target / rms_rx
-                            if err > 1:
-                                self._rx_agc_gain += self.cfg.rx_agc_attack  * (err - 1)
+                    if RX_BUFFER_PACKETS > 0:
+                        # ── Modo buffer (Raspberry Pi) ──────────────────
+                        self._rx_audio_buf.extend(payload)
+                        if len(self._rx_audio_buf) >= _rx_buf_size:
+                            bloque = bytes(self._rx_audio_buf[:_rx_buf_size])
+                            self._rx_audio_buf = self._rx_audio_buf[_rx_buf_size:]
+    
+                            if SAMPLE_RATE == 48000:
+                                audio48, rx_state = audioop.ratecv(
+                                    bloque, 2, 1, 8000, 48000, rx_state)
+                                spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
+                                if spk_gain != 1.0:
+                                    audio48 = audioop.mul(audio48, 2, spk_gain)
+                                if self.cfg.rx_agc_enable:
+                                    rms_rx = audioop.rms(audio48, 2) or 1
+                                    max_rx = audioop.max(audio48, 2)
+                                    if max_rx > 26000:
+                                        peak_ratio = 32767 / max_rx
+                                        target_gain = self._rx_agc_gain * peak_ratio * 0.9
+                                    else:
+                                        if rms_rx > self.cfg.rx_agc_target * AGC_KNEE:
+                                            excess = rms_rx - self.cfg.rx_agc_target * AGC_KNEE
+                                            compressed_excess = excess / AGC_KNEE_RATIO
+                                            target_rms = self.cfg.rx_agc_target * AGC_KNEE + compressed_excess
+                                        else:
+                                            target_rms = self.cfg.rx_agc_target
+                                        target_gain = target_rms / rms_rx
+                                    gain_diff = target_gain - self._rx_agc_gain
+                                    if gain_diff > 0:
+                                        gain_diff = min(gain_diff, AGC_MAX_GAIN_STEP)
+                                    else:
+                                        gain_diff = max(gain_diff, -AGC_MAX_GAIN_STEP * 2)
+                                    self._rx_agc_gain += gain_diff
+                                    self._rx_agc_gain = max(0.3, min(self._rx_agc_gain, self.cfg.rx_agc_max_gain))
+                                    audio48 = audioop.mul(audio48, 2, self._rx_agc_gain)
+                                audio48 = self._soft_clip(audio48)
+                                out_stream.write(bytes(audio48), CHUNK * RX_BUFFER_PACKETS)
                             else:
-                                self._rx_agc_gain += self.cfg.rx_agc_release * (err - 1)
-                            self._rx_agc_gain = max(1.0, min(
-                                self._rx_agc_gain, self.cfg.rx_agc_max_gain))
-                            audio48 = audioop.mul(audio48, 2, self._rx_agc_gain)
-                        out_stream.write(bytes(audio48), CHUNK)
+                                spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
+                                payload_out = audioop.mul(bloque, 2, spk_gain) if spk_gain != 1.0 else bloque
+                                if self.cfg.rx_agc_enable:
+                                    rms_rx = audioop.rms(payload_out, 2) or 1
+                                    max_rx = audioop.max(payload_out, 2)
+                                    if max_rx > 26000:
+                                        peak_ratio = 32767 / max_rx
+                                        target_gain = self._rx_agc_gain * peak_ratio * 0.9
+                                    else:
+                                        if rms_rx > self.cfg.rx_agc_target * AGC_KNEE:
+                                            excess = rms_rx - self.cfg.rx_agc_target * AGC_KNEE
+                                            compressed_excess = excess / AGC_KNEE_RATIO
+                                            target_rms = self.cfg.rx_agc_target * AGC_KNEE + compressed_excess
+                                        else:
+                                            target_rms = self.cfg.rx_agc_target
+                                        target_gain = target_rms / rms_rx
+                                    gain_diff = target_gain - self._rx_agc_gain
+                                    if gain_diff > 0:
+                                        gain_diff = min(gain_diff, AGC_MAX_GAIN_STEP)
+                                    else:
+                                        gain_diff = max(gain_diff, -AGC_MAX_GAIN_STEP * 2)
+                                    self._rx_agc_gain += gain_diff
+                                    self._rx_agc_gain = max(0.3, min(self._rx_agc_gain, self.cfg.rx_agc_max_gain))
+                                    payload_out = audioop.mul(payload_out, 2, self._rx_agc_gain)
+                                payload_out = self._soft_clip(payload_out)
+                                out_stream.write(payload_out, CHUNK * RX_BUFFER_PACKETS)
                     else:
-                        spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
-                        payload_out = audioop.mul(payload, 2, spk_gain) if spk_gain != 1.0 else payload
-                        if self.cfg.rx_agc_enable:
-                            rms_rx = audioop.rms(payload_out, 2) or 1
-                            err = self.cfg.rx_agc_target / rms_rx
-                            if err > 1:
-                                self._rx_agc_gain += self.cfg.rx_agc_attack  * (err - 1)
-                            else:
-                                self._rx_agc_gain += self.cfg.rx_agc_release * (err - 1)
-                            self._rx_agc_gain = max(1.0, min(
-                                self._rx_agc_gain, self.cfg.rx_agc_max_gain))
-                            payload_out = audioop.mul(payload_out, 2, self._rx_agc_gain)
-                        out_stream.write(payload_out, CHUNK)
+                        # ── Modo directo (PC rápido) ────────────────────
+                        if SAMPLE_RATE == 48000:
+                            audio48, rx_state = audioop.ratecv(
+                                payload, 2, 1, 8000, 48000, rx_state)
+                            spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
+                            if spk_gain != 1.0:
+                                audio48 = audioop.mul(audio48, 2, spk_gain)
+                            if self.cfg.rx_agc_enable:
+                                rms_rx = audioop.rms(audio48, 2) or 1
+                                max_rx = audioop.max(audio48, 2)
+                                if max_rx > 26000:
+                                    peak_ratio = 32767 / max_rx
+                                    target_gain = self._rx_agc_gain * peak_ratio * 0.9
+                                else:
+                                    if rms_rx > self.cfg.rx_agc_target * AGC_KNEE:
+                                        excess = rms_rx - self.cfg.rx_agc_target * AGC_KNEE
+                                        compressed_excess = excess / AGC_KNEE_RATIO
+                                        target_rms = self.cfg.rx_agc_target * AGC_KNEE + compressed_excess
+                                    else:
+                                        target_rms = self.cfg.rx_agc_target
+                                    target_gain = target_rms / rms_rx
+                                gain_diff = target_gain - self._rx_agc_gain
+                                if gain_diff > 0:
+                                    gain_diff = min(gain_diff, AGC_MAX_GAIN_STEP)
+                                else:
+                                    gain_diff = max(gain_diff, -AGC_MAX_GAIN_STEP * 2)
+                                self._rx_agc_gain += gain_diff
+                                self._rx_agc_gain = max(0.3, min(self._rx_agc_gain, self.cfg.rx_agc_max_gain))
+                                audio48 = audioop.mul(audio48, 2, self._rx_agc_gain)
+                            audio48 = self._soft_clip(audio48)
+                            out_stream.write(bytes(audio48), CHUNK)
+                        else:
+                            spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
+                            payload_out = audioop.mul(payload, 2, spk_gain) if spk_gain != 1.0 else payload
+                            if self.cfg.rx_agc_enable:
+                                rms_rx = audioop.rms(payload_out, 2) or 1
+                                max_rx = audioop.max(payload_out, 2)
+                                if max_rx > 26000:
+                                    peak_ratio = 32767 / max_rx
+                                    target_gain = self._rx_agc_gain * peak_ratio * 0.9
+                                else:
+                                    if rms_rx > self.cfg.rx_agc_target * AGC_KNEE:
+                                        excess = rms_rx - self.cfg.rx_agc_target * AGC_KNEE
+                                        compressed_excess = excess / AGC_KNEE_RATIO
+                                        target_rms = self.cfg.rx_agc_target * AGC_KNEE + compressed_excess
+                                    else:
+                                        target_rms = self.cfg.rx_agc_target
+                                    target_gain = target_rms / rms_rx
+                                gain_diff = target_gain - self._rx_agc_gain
+                                if gain_diff > 0:
+                                    gain_diff = min(gain_diff, AGC_MAX_GAIN_STEP)
+                                else:
+                                    gain_diff = max(gain_diff, -AGC_MAX_GAIN_STEP * 2)
+                                self._rx_agc_gain += gain_diff
+                                self._rx_agc_gain = max(0.3, min(self._rx_agc_gain, self.cfg.rx_agc_max_gain))
+                                payload_out = audioop.mul(payload_out, 2, self._rx_agc_gain)
+                            payload_out = self._soft_clip(payload_out)
+                            out_stream.write(payload_out, CHUNK)
+    
+                    # ── Audio level para la barra ───────────────────────
                     if (seq % self.cfg.level_every_sample) == 0:
                         rms = audioop.rms(payload, 2)
-                        self._fire('audio_level', int(rms / 100))
-
+                        level = min(int(rms / 35), 100)
+                        self._fire('audio_level', level)
+    
                     # ── Packet loss tracking ──────────────────────────────
                     if keyup:
                         if _rx_seq_first == -1:
@@ -635,15 +816,18 @@ class USRPCore:
                         else:
                             _rx_pkt_rcv += 1
                         _rx_seq_last = seq
-
+    
                 if keyup != last_key:
                     if keyup:
                         start_time    = time()
+                        self._rx_audio_buf = bytearray()
                         _rx_seq_first = -1
                         _rx_seq_last  = -1
                         _rx_pkt_rcv   = 0
                     else:
-                        # Calculate packet loss from sequence gaps
+                        duration = time() - start_time
+                        if duration > 300:
+                            duration = 0.0
                         if _rx_seq_first >= 0 and _rx_seq_last > _rx_seq_first:
                             _rx_pkt_exp = _rx_seq_last - _rx_seq_first + 1
                             lost        = max(0, _rx_pkt_exp - _rx_pkt_rcv)
@@ -651,15 +835,14 @@ class USRPCore:
                         else:
                             loss = '0.0%'
                         self._fire('rx_end', call, tg, loss,
-                                   time() - start_time, start_time)
+                                   duration, start_time)
                         self._tx_enable = True
                         self._fire('transmit_enable', True)
                         self._fire('audio_level', 0)
-                        # Reset for next transmission
                         _rx_seq_first = -1
                         loss          = ''
                     last_key = keyup
-
+    
             # ---- Text / protocol messages ------------------------------
             elif pkt_type == USRP_TYPE_TEXT:
                 if payload[:4] == REG:
@@ -680,7 +863,7 @@ class USRPCore:
                             sleep(secs)
                             self.register_with_ab()
                     logging.info(payload[:payload.find(b'\x00')].decode('ASCII'))
-
+    
                 elif payload[:5] == INFO:
                     body = payload[5:payload.find(b'\x00')].decode('ASCII')
                     if body[:4] == "MSG:":
@@ -693,54 +876,79 @@ class USRPCore:
                         self.macros = macs
                         if body[:6] == "MACRO:":
                             self._fire('macro_received', macs)
-                        else:
-                            try:
-                                obj  = json.loads(body)
-                                mode = obj["tlv"]["ambe_mode"]
-                                new_mode = "YSF" if mode[:3] == "YSF" else mode
-                                if new_mode != self._current_mode and not self._tx_enable:
-                                    self._tx_enable = True
-                                    self._fire('transmit_enable', True)
-                                    self._fire('rx_end', '', '', '', 0.0, 0.0)
-                                    self._fire('audio_level', 0)
-                                self._current_mode = new_mode
-                                self._fire('mode_change', new_mode,
-                                           obj.get("last_tune", ""))
-                            except Exception as exc:
-                                logging.warning("INFO JSON parse error: %s", exc)
+                    else:
+                        try:
+                            obj  = json.loads(body)
+                            mode = obj["tlv"]["ambe_mode"]
+                            new_mode = "YSF" if mode[:3] == "YSF" else mode
+                            last_tune = obj.get("last_tune", "")
+                            logging.info(f"INFO mode_change: {new_mode}, last_tune={last_tune}")
+                            if new_mode != self._current_mode and not self._tx_enable:
+                                self._tx_enable = True
+                                self._fire('transmit_enable', True)
+                                self._fire('rx_end', '', '', '', 0.0, 0.0)
+                                self._fire('audio_level', 0)
+                            self._current_mode = new_mode
+                            self._fire('mode_change', new_mode, last_tune)
+                            if last_tune:
+                                self._current_tg = last_tune
+                                self.set_remote_tg(last_tune)
+                        except Exception as exc:
+                            logging.warning("INFO JSON parse error: %s", exc)
                 else:
-                    # TLV embedded in TEXT payload
                     if payload[0] == TLV_TAG_SET_INFO:
+                        rid = (payload[2] << 16) | (payload[3] << 8) | payload[4]
+                        # Ignorar nuestro propio eco
+                        if rid == self.cfg.subscriber_id:
+                            if last_key == 1:
+                                # Forzar fin inmediato de recepción propia
+                                self._fire('rx_end', call, tg, '0.0%', 0.0, start_time)
+                                self._tx_enable = True
+                                self._fire('transmit_enable', True)
+                                self._fire('audio_level', 0)
+                                last_key = 0
+                                call = name = tg = rxslot = loss = ''
+                                self._rx_audio_buf = bytearray()
+                                _rx_seq_first = -1
+                            continue
+    
                         if not self._tx_enable:
-                            # Missed EOT – close previous transmission
                             if _rx_seq_first >= 0 and _rx_seq_last > _rx_seq_first:
                                 _rx_pkt_exp = _rx_seq_last - _rx_seq_first + 1
                                 lost        = max(0, _rx_pkt_exp - _rx_pkt_rcv)
                                 loss        = f'{lost / _rx_pkt_exp * 100:.1f}%'
+                            duration = time() - start_time
+                            if duration > 300:
+                                duration = 0.0
                             self._fire('rx_end', call, tg, loss,
-                                       time() - start_time, start_time)
+                                       duration, start_time)
                             _rx_seq_first = -1
                             loss          = ''
-
-                        rid    = (payload[2] << 16) | (payload[3] << 8) | payload[4]
+    
                         tg_num = (payload[9] << 16) | (payload[10] << 8) | payload[11]
                         rxslot = str(payload[12])
                         rxcc   = payload[13]
                         mode_s = "Private" if (rxcc & 0x80) else "Group"
                         name   = ""
-
+    
                         if payload[14] == 0:
                             call = str(rid)
                         else:
-                            raw_call = payload[14:payload.find(b'\x00', 14)].decode('ASCII')
+                            try:
+                                raw_call = payload[14:payload.find(b'\x00', 14)].decode('utf-8', errors='replace')
+                            except Exception:
+                                raw_call = payload[14:payload.find(b'\x00', 14)].decode('latin-1', errors='replace')
                             if raw_call.startswith('{'):
-                                obj  = json.loads(raw_call)
-                                call = obj['call']
-                                name = obj.get('name', '').split()[0] if obj.get('name') else ''
+                                try:
+                                    obj  = json.loads(raw_call)
+                                    call = obj['call']
+                                    name = obj.get('name', '').split()[0] if obj.get('name') else ''
+                                except Exception:
+                                    call = str(rid)
+                                    name = ''
                             else:
                                 call = raw_call
-
-                        # Resolve TG number → friendly name
+    
                         tg = str(tg_num)
                         mode_tgs = self.talk_groups.get(self._current_mode, [])
                         if self._current_mode in ('DSTAR', 'YSF'):
@@ -752,14 +960,13 @@ class USRPCore:
                                 if item[1] == str(tg_num):
                                     tg = item[0]
                                     break
-
+    
                         self._tx_enable = False
                         self._fire('transmit_enable', False)
                         self._fire('rx_begin', call, tg, rxslot, mode_s, name)
                         if not call.isdigit():
                             self._fire('photo_request', call, name)
-
-                        # Incoming private call – auto-tune
+    
                         if (rxcc & 0x80) and (rid > 10000):
                             priv_tg = str(rid) + '#'
                             if priv_tg != self._current_tg:
@@ -767,7 +974,7 @@ class USRPCore:
                                 label = call + " Private"
                                 self.talk_groups[self._current_mode].append((label, priv_tg))
                                 self._fire('tg_added', self._current_mode, label, priv_tg)
-
+    
             # ---- Ping --------------------------------------------------
             elif pkt_type == USRP_TYPE_PING:
                 if not self._tx_enable:
@@ -777,14 +984,17 @@ class USRPCore:
                             _rx_pkt_exp = _rx_seq_last - _rx_seq_first + 1
                             lost        = max(0, _rx_pkt_exp - _rx_pkt_rcv)
                             loss        = f'{lost / _rx_pkt_exp * 100:.1f}%'
+                        duration = time() - start_time
+                        if duration > 300:
+                            duration = 0.0
                         self._fire('rx_end', call, tg, loss,
-                                   time() - start_time, start_time)
+                                   duration, start_time)
                         self._tx_enable = True
                         self._fire('transmit_enable', True)
                         _rx_seq_first = -1
                         loss          = ''
                     last_seq = seq
-
+    
             # ---- TLV ---------------------------------------------------
             elif pkt_type == USRP_TYPE_TLV:
                 if payload[0] == TLV_TAG_FILE_XFER:
@@ -828,19 +1038,7 @@ class USRPCore:
                 mic_gain = max(0, min(self.cfg.mic_vol, 100)) / 100.0
                 if mic_gain != 1.0:
                     audio = audioop.mul(audio, 2, mic_gain)
-
-                # ── TX AGC ────────────────────────────────────────────────
-                if self.cfg.agc_enable:
-                    rms_tx = audioop.rms(audio, 2) or 1
-                    err = self.cfg.agc_target / rms_tx
-                    if err > 1:
-                        self._tx_agc_gain += self.cfg.agc_attack  * (err - 1)
-                    else:
-                        self._tx_agc_gain += self.cfg.agc_release * (err - 1)
-                    self._tx_agc_gain = max(1.0, min(
-                        self._tx_agc_gain, self.cfg.agc_max_gain))
-                    audio = audioop.mul(audio, 2, self._tx_agc_gain)
-
+                    
                 # ---- VOX -------------------------------------------
                 if self.vox_enable:
                     if rms > self.vox_threshold:
@@ -871,8 +1069,8 @@ class USRPCore:
                         USRP_TYPE_VOICE, 0, 0) + audio
                     self._sendto(pkt)
                     self._usrp_seq = (self._usrp_seq + 1) & 0xffff
-                    self._fire('audio_level', int(rms / 100))
-
+                    level = min(int(rms / 40), 100)
+                    self._fire('audio_level', level)
             except Exception as exc:
                 logging.warning("TX thread: %s", exc)
 

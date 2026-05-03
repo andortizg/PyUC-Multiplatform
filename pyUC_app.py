@@ -339,7 +339,9 @@ class USRPApp:
 
         # USRP core (UDP sockets + audio threads + registers with AB)
         self.core.start()
-
+        # Solicitar INFO de nuevo cuando la UI ya está corriendo
+        threading.Timer(2.0, self.core.request_info).start()
+    
     def stop(self):
         """Shuts down core and all services cleanly."""
         if self._done:

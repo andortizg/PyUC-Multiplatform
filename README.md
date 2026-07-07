@@ -36,6 +36,56 @@ This edition cleanly separates the USRP protocol engine from the UI layer into i
 
 ---
 
+## What's new in v2.0
+
+### Core — audio pipeline rewrite (`pyUC_core.py`)
+
+The entire RX audio path has been redesigned to eliminate the micro-cuts that appeared during reception, particularly on Raspberry Pi 3B+.
+
+**Decoupled RX/play threads.** Previously the USRP receive thread was also responsible for audio playback, so any network jitter or CPU spike stalled PortAudio directly. In v2.0 the receive thread only enqueues raw 8 kHz payloads into a thread-safe queue (the jitter buffer); a dedicated `_play_thread` drains it and writes to PortAudio independently.
+
+**Jitter buffer with prefill.** `_play_thread` accumulates `RX_BUFFER_PACKETS + RX_PREFILL_PACKETS` packets (≈ 100 ms) before starting playback on each new transmission. This absorbs network jitter bursts without audible gaps.
+
+**Silence injection on underrun.** If the queue empties mid-transmission, the play thread writes up to `RX_MAX_SILENCE_BLOCKS` silent frames to keep the PortAudio stream cebado. This prevents the click caused by stream re-arming after a momentary gap.
+
+**All DSP at 8 kHz.** Speaker volume, RX AGC and soft clip now operate on the 8 kHz payload before resampling. This reduces the DSP workload by 6× compared to processing at 48 kHz. The final `audioop.ratecv` to 48 kHz only happens if the output device requires it (see below).
+
+**Native 8 kHz streams.** The output and input streams now open at 8 kHz by default (`native8k = 1`), delegating resampling to ALSA `plughw` in C. The `audioop.ratecv` calls in both directions are eliminated entirely on hardware that supports 8 kHz (most USB audio adapters and the RPi built-in audio do). If a device rejects 8 kHz, the streams fall back automatically to 48 kHz and the Python resampling is restored.
+
+**Optimised soft clip.** `_soft_clip` now returns the input unchanged (no allocation) if `audioop.max` shows no sample exceeds the threshold — the common case. When clipping is needed, it uses numpy vectorised operations if numpy is installed, or the existing sample loop otherwise.
+
+**TX thread idle path.** When PTT is off and VOX is disabled, the TX thread drains the microphone input without resampling or computing RMS, reducing GIL contention against the play thread during reception.
+
+**Minor fixes.** `settimeout` moved outside the receive loop (was being reset every packet). `del buf[:n]` replaces slice assignment to avoid copying the tail on every block.
+
+### UI — numeric keypad (`pyUC_ui_ctk.py`)
+
+A walkie-talkie style numeric keypad popup opens when the user clicks the TG entry field. This is designed for touchscreen operation on Raspberry Pi where typing on a physical keyboard is inconvenient.
+
+- Layout: digits 1–9, `*`, `0`, `#`, backspace `⌫`, `ESC` and a full-width `CALL` button.
+- Positioned automatically below the TG entry field, clamped to screen edges.
+- Physical keyboard continues to work on the entry field at all times — the keypad is additive, not a replacement.
+- Keyboard shortcuts: digit/`*`/`#` keys add to the display, `BackSpace` deletes, `Enter` dials, `Escape` closes.
+- Can be enabled or disabled at runtime via **Settings → GPIO → Numeric keypad on TG click** without restarting.
+- Controlled by `keypadEnable` in `pyUC.ini`.
+
+### UI — private call checkbox (`pyUC_ui_ctk.py`)
+
+The compact G/P dropdown for DMR private calls has been replaced by a **Priv** checkbox to the right of the TG entry. Unchecked = group call (default); checked = private call (appends `#` to the dial string).
+
+### UI — VU meter optimisation (`pyUC_ui_ctk.py`)
+
+The audio level meter no longer calls `canvas.delete('all')` and `create_rectangle` on every pump cycle (100 ms). Instead it creates the bar rectangle once and repositions it with `canvas.coords()`, caching the canvas height and the last painted fill width. The canvas is not touched at all if the level has not changed since the previous frame.
+
+### Configuration additions (`pyUC_config.py`, `pyUC.ini`)
+
+| Key | Default | Description |
+|---|---|---|
+| `native8k` | `1` | Open audio streams at 8 kHz; ALSA resamples in C. `0` = force 48 kHz (Python resampling) |
+| `keypadEnable` | `1` | Show numeric keypad popup on TG entry click |
+
+---
+
 ## Architecture
 
 ```
@@ -117,12 +167,13 @@ pip install audioop-lts
 | `requests` | Recommended | QRZ photo scraping, Pi-Star download |
 | `beautifulsoup4` | Recommended | QRZ photo URL parsing |
 | `psutil` | Optional | CPU / RAM / temperature in topbar |
+| `numpy` | Optional | Faster soft clip in RX DSP path |
 | `RPi.GPIO` | Optional (RPi only) | Physical GPIO PTT button |
 
 Install all at once:
 
 ```bash
-pip install customtkinter pyaudio Pillow requests beautifulsoup4 psutil
+pip install customtkinter pyaudio Pillow requests beautifulsoup4 psutil numpy
 ```
 
 ### Raspberry Pi (Trixie / Python 3.13)
@@ -134,12 +185,17 @@ sudo apt install portaudio19-dev python3-dev python3-tk python3-rpi.gpio
 # Python packages in a venv (recommended on Trixie)
 python3 -m venv ~/pyuc_env
 source ~/pyuc_env/bin/activate
-pip install customtkinter pyaudio Pillow requests beautifulsoup4 psutil audioop-lts
+pip install customtkinter pyaudio Pillow requests beautifulsoup4 psutil numpy audioop-lts
 ```
 
 > **JACK / ALSA noise:** On Raspberry Pi the application pre-loads `libjack` and installs an ALSA null error handler before opening any audio device. The wall of "Unknown PCM / Cannot connect to JACK" messages is suppressed automatically. If the application still segfaults, the cleanest fix is to remove the unused JACK packages:
 > ```bash
 > sudo apt remove --purge libjack-jackd2-0 jackd2 && sudo apt autoremove
+> ```
+
+> **CPU governor:** For best audio performance on Raspberry Pi set the governor to `performance`:
+> ```bash
+> sudo cpufreq-set -g performance
 > ```
 
 ---
@@ -186,6 +242,7 @@ All settings live in `pyUC.ini`.
 | `slot` | `2` | DMR time slot (1 or 2) |
 | `in_index` | *(default)* | pyaudio input device index, or `-1` for RX-only |
 | `out_index` | *(default)* | pyaudio output device index |
+| `native8k` | `1` | Open audio streams at 8 kHz natively; `0` = force 48 kHz |
 | `micVol` | `50` | Microphone software gain 0–100 (applied as PCM multiplier) |
 | `spkVol` | `50` | Speaker software gain 0–100 |
 | `screenProfile` | *(auto)* | `pc` \| `rpi5` \| `rpi35`; auto-detected from `windowWidth/Height` |
@@ -204,6 +261,7 @@ All settings live in `pyUC.ini`.
 | `gpioPttPin` | `-1` | BCM GPIO pin for hardware PTT (`-1` = disabled) |
 | `gpioPttActiveLow` | `1` | `1` = active low (internal pull-up) |
 | `spacebarPtt` | `1` | `1` = spacebar toggles PTT when app has focus |
+| `keypadEnable` | `1` | `1` = show numeric keypad popup on TG entry click |
 | `useQRZ` | `1` | `1` = scrape operator photo from QRZ.com |
 | `hamUser` | *(empty)* | HamQTH username for grid-locator and city lookup |
 | `hamPass` | *(empty)* | HamQTH password |
@@ -334,6 +392,7 @@ See `USRP_API_reference.md` for the full API reference including packet formats,
 | Role | Callsign | Name |
 |---|---|---|
 | Fork: UI redesign, multi-screen, HamQTH, AGC, GPIO PTT, Pi-Star, architecture | **EA7HQL** | Andrés Ortiz |
+| v2.0: audio pipeline rewrite, jitter buffer, native 8 kHz streams, keypad UI | **EA7HQL** | Andrés Ortiz |
 | Original pyUC author | **N4IRR** | Mike |
 | Original DVSwitch co-author | **N4IRS** | Steve |
 | Raspberry Pi UI inspiration | **DS5QDR** | Heonmin Lee |

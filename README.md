@@ -200,7 +200,57 @@ pip install customtkinter pyaudio Pillow requests beautifulsoup4 psutil numpy au
 
 ---
 
-## Quick start
+## How to compile / install
+
+pyUC is pure Python — no compilation step is needed. Setup consists of creating a virtual environment and installing the dependencies.
+
+### Linux / Raspberry Pi
+
+```bash
+# 1. System-level build deps (needed by pyaudio → PortAudio)
+sudo apt install portaudio19-dev python3-dev python3-tk python3-rpi.gpio
+
+# 2. Create and activate virtual environment
+python3 -m venv ~/pyuc_env
+source ~/pyuc_env/bin/activate
+
+# 3. Install Python dependencies
+pip install --upgrade pip
+pip install customtkinter pyaudio Pillow requests beautifulsoup4 psutil numpy
+
+# Python 3.13+ only (audioop removed from stdlib)
+pip install audioop-lts
+
+# 4. Run
+python3 pyUC_app.py
+```
+
+### Windows / macOS
+
+```bash
+# 1. Create and activate virtual environment
+python -m venv pyuc_env
+source pyuc_env/bin/activate   # macOS / Linux
+pyuc_env\Scripts\activate      # Windows
+
+# 2. Install Python dependencies
+pip install --upgrade pip
+pip install customtkinter pyaudio Pillow requests beautifulsoup4 psutil numpy
+
+# Python 3.13+ only
+pip install audioop-lts
+
+# 3. Run
+python pyUC_app.py
+```
+
+> **pyaudio on Windows:** if `pip install pyaudio` fails, download the matching `.whl` from [Unofficial Windows Binaries](https://www.lfd.uci.edu/~gohlke/pythonlibs/#pyaudio) and install it with `pip install <file>.whl`.
+
+> **pyaudio on macOS:** install PortAudio first via Homebrew: `brew install portaudio`, then `pip install pyaudio`.
+
+---
+
+
 
 1. Copy `pyUC.ini` and edit the `[DEFAULTS]` section at minimum:
 

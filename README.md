@@ -202,7 +202,7 @@ pip install customtkinter pyaudio Pillow requests beautifulsoup4 psutil numpy au
 
 ## How to compile / install
 
-pyUC is pure Python — no compilation step is needed. Setup consists of creating a virtual environment and installing the dependencies.
+pyUC is pure Python - no compilation step is needed. Setup consists of creating a virtual environment and installing the dependencies. However, you can create an standalone file using nuitka.
 
 ### Linux / Raspberry Pi
 

@@ -12,6 +12,12 @@ import threading
 import queue
 import logging
 import math
+import array
+
+try:
+    import numpy as _np          # opcional: acelera el soft clip si está instalado
+except ImportError:
+    _np = None
 
 try:
     import audioop
@@ -67,6 +73,14 @@ SAMPLE_RATE = 48000
 # 0 = procesar paquete a paquete (PC rápido)
 # 2-4 = recomendado para Raspberry Pi
 RX_BUFFER_PACKETS = 3
+
+# Jitter buffer: paquetes de prearranque antes de empezar a reproducir (punto 2).
+# Da margen contra jitter de red. 2 paquetes ≈ 40 ms extra de latencia.
+RX_PREFILL_PACKETS = 2
+
+# Máximo de bloques de silencio consecutivos a inyectar en underrun (punto 3)
+# antes de asumir que la transmisión terminó. blk_size≈60ms → 5 ≈ 300 ms.
+RX_MAX_SILENCE_BLOCKS = 5
 
 # ---------------------------------------------------------------------------
 # Soft clip parameters 
@@ -255,6 +269,9 @@ class USRPCore:
         self._no_quote     = {ord('"'): ''}
         self._file_md5     = None
 
+        # Cola RX→reproducción (jitter buffer). maxsize=64 ≈ 1.28 s de audio.
+        self._audio_q: queue.Queue = queue.Queue(maxsize=64)
+
         _all_events = [
             'registered', 'unregistered',
             'rx_begin', 'rx_end',
@@ -346,7 +363,8 @@ class USRPCore:
         self._open_udp()
         self._pyaudio = pyaudio.PyAudio()
 
-        threading.Thread(target=self._rx_thread, daemon=True, name="usrp-rx").start()
+        threading.Thread(target=self._rx_thread,   daemon=True, name="usrp-rx").start()
+        threading.Thread(target=self._play_thread, daemon=True, name="usrp-play").start()
         if self.cfg.in_index != -1:
             threading.Thread(target=self._tx_thread, daemon=True, name="usrp-tx").start()
         if self.cfg.nat_ping_timer > 0:
@@ -517,9 +535,27 @@ class USRPCore:
     @staticmethod
     def _soft_clip(data: bytes, threshold: int = SOFT_CLIP_THRESHOLD,
                    ratio: float = SOFT_CLIP_RATIO) -> bytes:
+        """
+        Soft clipping de audio PCM 16-bit mono.
+        :param data:      bytes PCM s16le
+        :param threshold: umbral absoluto (0-32767) donde empieza la compresión
+        :param ratio:     factor de compresión por encima del umbral (1.0 = off)
+        :return: bytes PCM s16le del mismo tamaño
+        Optimización: salida inmediata (audioop.max, en C) si ningún pico supera
+        el umbral — el caso habitual. Solo procesa bloques realmente altos, y con
+        numpy vectorizado si está disponible.
+        """
         if ratio >= 1.0:
             return data
-        import array
+        if audioop.max(data, 2) <= threshold:      # fast path (C): sin picos
+            return data
+        if _np is not None:
+            s = _np.frombuffer(data, dtype=_np.int16).astype(_np.int32)
+            hi = s >  threshold
+            lo = s < -threshold
+            s[hi] =  threshold + ((s[hi] - threshold) * ratio).astype(_np.int32)
+            s[lo] = -threshold + ((s[lo] + threshold) * ratio).astype(_np.int32)
+            return _np.clip(s, -32768, 32767).astype(_np.int16).tobytes()
         samples = array.array('h', data)
         for i, s in enumerate(samples):
             if s > threshold:
@@ -527,6 +563,200 @@ class USRPCore:
             elif s < -threshold:
                 samples[i] = int(-threshold + (s + threshold) * ratio)
         return samples.tobytes()
+
+    def _flush_audio_q(self):
+        """
+        Vacía la cola de audio pendiente y envía el sentinel None al hilo de
+        reproducción para que descarte también su buffer parcial.
+        Sin parámetros; no devuelve nada.
+        """
+        try:
+            while True:
+                self._audio_q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._audio_q.put_nowait(None)
+        except queue.Full:
+            pass
+
+    def _open_out_stream(self):
+        """
+        Abre el stream de salida de PortAudio, intentando 8 kHz nativo primero
+        (ALSA plughw remuestrea en C) y cayendo a SAMPLE_RATE (48 kHz) si el
+        dispositivo lo rechaza.
+        :return: (stream, rate:int, chunk:int)
+                 stream  -> objeto PyAudio.Stream abierto para salida
+                 rate    -> tasa de muestreo real del stream (8000 o SAMPLE_RATE)
+                 chunk   -> frames por buffer base (160 @8k, 960 @48k)
+        :raises Exception: si ningún modo consigue abrir el stream
+        """
+        want_8k = getattr(self.cfg, 'native_8k', True)
+        attempts = [(8000, 160)] if want_8k else []
+        attempts.append((SAMPLE_RATE, 960))
+        last_exc = None
+        for rate, chunk in attempts:
+            try:
+                stream = self._pyaudio.open(
+                    format=pyaudio.paInt16, channels=1, rate=rate,
+                    output=True, frames_per_buffer=chunk * 8,
+                    output_device_index=self.cfg.out_index)
+                logging.info("Output stream abierto a %d Hz", rate)
+                return stream, rate, chunk
+            except Exception as exc:
+                last_exc = exc
+                logging.warning("Output stream %d Hz falló: %s", rate, exc)
+        raise last_exc
+
+    def _open_in_stream(self):
+        """
+        Abre el stream de entrada (micro), intentando 8 kHz nativo primero y
+        cayendo a SAMPLE_RATE si el dispositivo lo rechaza.
+        :return: (stream, rate:int, chunk:int)
+                 stream  -> objeto PyAudio.Stream abierto para entrada
+                 rate    -> tasa de muestreo real (8000 o SAMPLE_RATE)
+                 chunk   -> frames por lectura (160 @8k, 960 @48k)
+        :raises Exception: si ningún modo consigue abrir el stream
+        """
+        want_8k = getattr(self.cfg, 'native_8k', True)
+        attempts = [(8000, 160)] if want_8k else []
+        attempts.append((SAMPLE_RATE, 960))
+        last_exc = None
+        for rate, chunk in attempts:
+            try:
+                stream = self._pyaudio.open(
+                    format=pyaudio.paInt16, channels=1, rate=rate,
+                    input=True, frames_per_buffer=chunk,
+                    input_device_index=self.cfg.in_index)
+                logging.info("Input stream abierto a %d Hz", rate)
+                return stream, rate, chunk
+            except Exception as exc:
+                last_exc = exc
+                logging.warning("Input stream %d Hz falló: %s", rate, exc)
+        raise last_exc
+
+    # -----------------------------------------------------------------------
+    # RX DSP (a 8 kHz — 6× menos muestras que hacerlo a 48 kHz)
+    # -----------------------------------------------------------------------
+    def _process_rx_block(self, block8k: bytes, rx_state, out_rate: int):
+        """
+        Procesa un bloque de audio RX: volumen, AGC y soft clip a 8 kHz,
+        y remuestrea a out_rate solo si el stream de salida no es de 8 kHz.
+        :param block8k:  bytes PCM s16le mono a 8 kHz
+        :param rx_state: estado de audioop.ratecv (None en el primer bloque)
+        :param out_rate: tasa real del stream de salida (8000 → sin remuestreo)
+        :return: (audio_out: bytes a out_rate, rx_state actualizado)
+        """
+        out = block8k
+        spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
+        if spk_gain != 1.0:
+            out = audioop.mul(out, 2, spk_gain)
+
+        if self.cfg.rx_agc_enable:
+            rms_rx = audioop.rms(out, 2) or 1
+            max_rx = audioop.max(out, 2)
+            if max_rx > 26000:
+                peak_ratio  = 32767 / max_rx
+                target_gain = self._rx_agc_gain * peak_ratio * 0.9
+            else:
+                if rms_rx > self.cfg.rx_agc_target * AGC_KNEE:
+                    excess            = rms_rx - self.cfg.rx_agc_target * AGC_KNEE
+                    compressed_excess = excess / AGC_KNEE_RATIO
+                    target_rms        = self.cfg.rx_agc_target * AGC_KNEE + compressed_excess
+                else:
+                    target_rms = self.cfg.rx_agc_target
+                target_gain = target_rms / rms_rx
+            gain_diff = target_gain - self._rx_agc_gain
+            if gain_diff > 0:
+                gain_diff = min(gain_diff, AGC_MAX_GAIN_STEP)
+            else:
+                gain_diff = max(gain_diff, -AGC_MAX_GAIN_STEP * 2)
+            self._rx_agc_gain += gain_diff
+            self._rx_agc_gain = max(0.3, min(self._rx_agc_gain, self.cfg.rx_agc_max_gain))
+            out = audioop.mul(out, 2, self._rx_agc_gain)
+
+        out = self._soft_clip(out)
+
+        if out_rate != 8000:
+            out, rx_state = audioop.ratecv(out, 2, 1, 8000, out_rate, rx_state)
+        return out, rx_state
+
+    # -----------------------------------------------------------------------
+    # Hilo de reproducción (jitter buffer real, desacoplado de la red)
+    # -----------------------------------------------------------------------
+    def _play_thread(self):
+        """
+        Consume paquetes de voz de self._audio_q, los procesa y los reproduce.
+        Desacopla la recepción UDP (hilo RX) de la escritura bloqueante en
+        PortAudio, eliminando los underruns por jitter de red o carga de CPU.
+        Elementos de la cola:
+          bytes  → payload de voz de 320 bytes (20 ms @ 8 kHz)
+          None   → sentinel: nueva transmisión / reset → vaciar buffer parcial
+        """
+        try:
+            out_stream, out_rate, _ = self._open_out_stream()
+        except Exception as exc:
+            logging.critical("Cannot open output audio stream: %s", exc)
+            self._fire('error', "Output audio stream open error")
+            return
+
+        blk_size = 320 * max(1, RX_BUFFER_PACKETS)   # bytes por bloque de proceso
+        prefill_bytes = blk_size + 320 * RX_PREFILL_PACKETS   # umbral de prearranque
+        silence_in = b'\x00' * blk_size              # silencio a 8 kHz (pre-proceso)
+        buf         = bytearray()
+        rx_state    = None
+        priming     = True    # True = acumulando prearranque, aún sin reproducir
+        active      = False   # True = transmisión en curso (hay audio real fluyendo)
+        silence_run = 0       # bloques de silencio consecutivos inyectados
+
+        while not self._done:
+            try:
+                item = self._audio_q.get(timeout=0.1)
+            except queue.Empty:
+                # Underrun: si la transmisión sigue activa y no hay datos,
+                # inyectar silencio para mantener PortAudio cebado (punto 3).
+                if active and not priming:
+                    if buf:
+                        audio_out, rx_state = self._process_rx_block(bytes(buf), rx_state, out_rate)
+                        out_stream.write(audio_out, len(audio_out) // 2)
+                        buf.clear()
+                    elif silence_run < RX_MAX_SILENCE_BLOCKS:
+                        audio_out, rx_state = self._process_rx_block(silence_in, rx_state, out_rate)
+                        out_stream.write(audio_out, len(audio_out) // 2)
+                        silence_run += 1
+                    else:
+                        active = False   # asumir fin de transmisión sin sentinel
+                continue
+
+            if item is None:                  # reset (nueva transmisión / cambio de modo)
+                buf.clear()
+                rx_state    = None
+                priming     = True
+                active      = False
+                silence_run = 0
+                continue
+
+            active      = True
+            silence_run = 0
+            buf.extend(item)
+
+            # Prearranque: no reproducir hasta acumular el umbral (punto 2)
+            if priming:
+                if len(buf) < prefill_bytes:
+                    continue
+                priming = False
+
+            while len(buf) >= blk_size:
+                block = bytes(buf[:blk_size])
+                del buf[:blk_size]            # in-place, sin copia del resto
+                audio_out, rx_state = self._process_rx_block(block, rx_state, out_rate)
+                out_stream.write(audio_out, len(audio_out) // 2)
+
+        try:
+            out_stream.stop_stream()
+            out_stream.close()
+        except Exception:
+            pass
     
     # -----------------------------------------------------------------------
     # PTT
@@ -591,36 +821,21 @@ class USRPCore:
         OK      = b'OK'
         INFO    = b'INFO:'
         EXITING = b'EXITING'
-        CHUNK   = 160 if SAMPLE_RATE == 8000 else 960
-    
-        try:
-            out_stream = self._pyaudio.open(
-                format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
-                output=True, frames_per_buffer=CHUNK * 4,
-                output_device_index=self.cfg.out_index)
-            self._rx_audio_buf = bytearray()
-            _rx_buf_size = 320 * RX_BUFFER_PACKETS if RX_BUFFER_PACKETS > 0 else 0
-    
-        except Exception as exc:
-            logging.critical("Cannot open output audio stream: %s", exc)
-            self._fire('error', "Output audio stream open error")
-            return
-    
+
         last_key = -1
         start_time = time()
         call = name = tg = rxslot = loss = ''
         last_seq = seq = 0
-        rx_state = None
         _rx_seq_first  = -1
         _rx_seq_last   = -1
         _rx_pkt_rcv    = 0
         _rx_pkt_exp    = 0
     
         last_rx_time = time()
-    
+        self._udp.settimeout(0.5)
+
         while not self._done:
             try:
-                self._udp.settimeout(0.5)
                 raw, _ = self._udp.recvfrom(1024)
                 last_rx_time = time()
             except socket.timeout:
@@ -639,7 +854,7 @@ class USRPCore:
                     self._tx_enable = True
                     last_key = 0
                     call = name = tg = rxslot = loss = ''
-                    self._rx_audio_buf = bytearray()
+                    self._flush_audio_q()
                     _rx_seq_first = -1
                 continue
             except Exception:
@@ -662,7 +877,7 @@ class USRPCore:
                 self._tx_enable = True
                 last_key = -1
                 call = name = tg = rxslot = loss = ''
-                self._rx_audio_buf = bytearray()
+                self._flush_audio_q()
                 _rx_seq_first = -1
                 continue
     
@@ -677,150 +892,10 @@ class USRPCore:
     
             # ---- Voice audio -------------------------------------------
             if pkt_type == USRP_TYPE_VOICE:
-                if len(payload) == 320:
-                    if RX_BUFFER_PACKETS > 0:
-                        # ── Modo buffer (Raspberry Pi) ──────────────────
-                        self._rx_audio_buf.extend(payload)
-                        if len(self._rx_audio_buf) >= _rx_buf_size:
-                            bloque = bytes(self._rx_audio_buf[:_rx_buf_size])
-                            self._rx_audio_buf = self._rx_audio_buf[_rx_buf_size:]
-    
-                            if SAMPLE_RATE == 48000:
-                                audio48, rx_state = audioop.ratecv(
-                                    bloque, 2, 1, 8000, 48000, rx_state)
-                                spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
-                                if spk_gain != 1.0:
-                                    audio48 = audioop.mul(audio48, 2, spk_gain)
-                                if self.cfg.rx_agc_enable:
-                                    rms_rx = audioop.rms(audio48, 2) or 1
-                                    max_rx = audioop.max(audio48, 2)
-                                    if max_rx > 26000:
-                                        peak_ratio = 32767 / max_rx
-                                        target_gain = self._rx_agc_gain * peak_ratio * 0.9
-                                    else:
-                                        if rms_rx > self.cfg.rx_agc_target * AGC_KNEE:
-                                            excess = rms_rx - self.cfg.rx_agc_target * AGC_KNEE
-                                            compressed_excess = excess / AGC_KNEE_RATIO
-                                            target_rms = self.cfg.rx_agc_target * AGC_KNEE + compressed_excess
-                                        else:
-                                            target_rms = self.cfg.rx_agc_target
-                                        target_gain = target_rms / rms_rx
-                                    gain_diff = target_gain - self._rx_agc_gain
-                                    if gain_diff > 0:
-                                        gain_diff = min(gain_diff, AGC_MAX_GAIN_STEP)
-                                    else:
-                                        gain_diff = max(gain_diff, -AGC_MAX_GAIN_STEP * 2)
-                                    self._rx_agc_gain += gain_diff
-                                    self._rx_agc_gain = max(0.3, min(self._rx_agc_gain, self.cfg.rx_agc_max_gain))
-                                    audio48 = audioop.mul(audio48, 2, self._rx_agc_gain)
-                                audio48 = self._soft_clip(audio48)
-                                out_stream.write(bytes(audio48), CHUNK * RX_BUFFER_PACKETS)
-                            else:
-                                spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
-                                payload_out = audioop.mul(bloque, 2, spk_gain) if spk_gain != 1.0 else bloque
-                                if self.cfg.rx_agc_enable:
-                                    rms_rx = audioop.rms(payload_out, 2) or 1
-                                    max_rx = audioop.max(payload_out, 2)
-                                    if max_rx > 26000:
-                                        peak_ratio = 32767 / max_rx
-                                        target_gain = self._rx_agc_gain * peak_ratio * 0.9
-                                    else:
-                                        if rms_rx > self.cfg.rx_agc_target * AGC_KNEE:
-                                            excess = rms_rx - self.cfg.rx_agc_target * AGC_KNEE
-                                            compressed_excess = excess / AGC_KNEE_RATIO
-                                            target_rms = self.cfg.rx_agc_target * AGC_KNEE + compressed_excess
-                                        else:
-                                            target_rms = self.cfg.rx_agc_target
-                                        target_gain = target_rms / rms_rx
-                                    gain_diff = target_gain - self._rx_agc_gain
-                                    if gain_diff > 0:
-                                        gain_diff = min(gain_diff, AGC_MAX_GAIN_STEP)
-                                    else:
-                                        gain_diff = max(gain_diff, -AGC_MAX_GAIN_STEP * 2)
-                                    self._rx_agc_gain += gain_diff
-                                    self._rx_agc_gain = max(0.3, min(self._rx_agc_gain, self.cfg.rx_agc_max_gain))
-                                    payload_out = audioop.mul(payload_out, 2, self._rx_agc_gain)
-                                payload_out = self._soft_clip(payload_out)
-                                out_stream.write(payload_out, CHUNK * RX_BUFFER_PACKETS)
-                    else:
-                        # ── Modo directo (PC rápido) ────────────────────
-                        if SAMPLE_RATE == 48000:
-                            audio48, rx_state = audioop.ratecv(
-                                payload, 2, 1, 8000, 48000, rx_state)
-                            spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
-                            if spk_gain != 1.0:
-                                audio48 = audioop.mul(audio48, 2, spk_gain)
-                            if self.cfg.rx_agc_enable:
-                                rms_rx = audioop.rms(audio48, 2) or 1
-                                max_rx = audioop.max(audio48, 2)
-                                if max_rx > 26000:
-                                    peak_ratio = 32767 / max_rx
-                                    target_gain = self._rx_agc_gain * peak_ratio * 0.9
-                                else:
-                                    if rms_rx > self.cfg.rx_agc_target * AGC_KNEE:
-                                        excess = rms_rx - self.cfg.rx_agc_target * AGC_KNEE
-                                        compressed_excess = excess / AGC_KNEE_RATIO
-                                        target_rms = self.cfg.rx_agc_target * AGC_KNEE + compressed_excess
-                                    else:
-                                        target_rms = self.cfg.rx_agc_target
-                                    target_gain = target_rms / rms_rx
-                                gain_diff = target_gain - self._rx_agc_gain
-                                if gain_diff > 0:
-                                    gain_diff = min(gain_diff, AGC_MAX_GAIN_STEP)
-                                else:
-                                    gain_diff = max(gain_diff, -AGC_MAX_GAIN_STEP * 2)
-                                self._rx_agc_gain += gain_diff
-                                self._rx_agc_gain = max(0.3, min(self._rx_agc_gain, self.cfg.rx_agc_max_gain))
-                                audio48 = audioop.mul(audio48, 2, self._rx_agc_gain)
-                            audio48 = self._soft_clip(audio48)
-                            out_stream.write(bytes(audio48), CHUNK)
-                        else:
-                            spk_gain = max(0, min(self.cfg.spk_vol, 100)) / 100.0
-                            payload_out = audioop.mul(payload, 2, spk_gain) if spk_gain != 1.0 else payload
-                            if self.cfg.rx_agc_enable:
-                                rms_rx = audioop.rms(payload_out, 2) or 1
-                                max_rx = audioop.max(payload_out, 2)
-                                if max_rx > 26000:
-                                    peak_ratio = 32767 / max_rx
-                                    target_gain = self._rx_agc_gain * peak_ratio * 0.9
-                                else:
-                                    if rms_rx > self.cfg.rx_agc_target * AGC_KNEE:
-                                        excess = rms_rx - self.cfg.rx_agc_target * AGC_KNEE
-                                        compressed_excess = excess / AGC_KNEE_RATIO
-                                        target_rms = self.cfg.rx_agc_target * AGC_KNEE + compressed_excess
-                                    else:
-                                        target_rms = self.cfg.rx_agc_target
-                                    target_gain = target_rms / rms_rx
-                                gain_diff = target_gain - self._rx_agc_gain
-                                if gain_diff > 0:
-                                    gain_diff = min(gain_diff, AGC_MAX_GAIN_STEP)
-                                else:
-                                    gain_diff = max(gain_diff, -AGC_MAX_GAIN_STEP * 2)
-                                self._rx_agc_gain += gain_diff
-                                self._rx_agc_gain = max(0.3, min(self._rx_agc_gain, self.cfg.rx_agc_max_gain))
-                                payload_out = audioop.mul(payload_out, 2, self._rx_agc_gain)
-                            payload_out = self._soft_clip(payload_out)
-                            out_stream.write(payload_out, CHUNK)
-    
-                    # ── Audio level para la barra ───────────────────────
-                    if (seq % self.cfg.level_every_sample) == 0:
-                        rms = audioop.rms(payload, 2)
-                        level = min(int(rms / 35), 100)
-                        self._fire('audio_level', level)
-    
-                    # ── Packet loss tracking ──────────────────────────────
-                    if keyup:
-                        if _rx_seq_first == -1:
-                            _rx_seq_first = seq
-                            _rx_pkt_rcv   = 1
-                        else:
-                            _rx_pkt_rcv += 1
-                        _rx_seq_last = seq
-    
                 if keyup != last_key:
                     if keyup:
                         start_time    = time()
-                        self._rx_audio_buf = bytearray()
+                        self._flush_audio_q()
                         _rx_seq_first = -1
                         _rx_seq_last  = -1
                         _rx_pkt_rcv   = 0
@@ -842,7 +917,38 @@ class USRPCore:
                         _rx_seq_first = -1
                         loss          = ''
                     last_key = keyup
+
+                if len(payload) == 320:
+                    # Encolar para el hilo de reproducción (jitter buffer).
+                    # Si la cola está llena (reproducción atascada) se descarta
+                    # el paquete más antiguo para no acumular latencia.
+                    try:
+                        self._audio_q.put_nowait(payload)
+                    except queue.Full:
+                        try:
+                            self._audio_q.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            self._audio_q.put_nowait(payload)
+                        except queue.Full:
+                            pass
+
+                    # ── Audio level para la barra ───────────────────────
+                    if (seq % self.cfg.level_every_sample) == 0:
+                        rms = audioop.rms(payload, 2)
+                        level = min(int(rms / 35), 100)
+                        self._fire('audio_level', level)
     
+                    # ── Packet loss tracking ──────────────────────────────
+                    if keyup:
+                        if _rx_seq_first == -1:
+                            _rx_seq_first = seq
+                            _rx_pkt_rcv   = 1
+                        else:
+                            _rx_pkt_rcv += 1
+                        _rx_seq_last = seq
+
             # ---- Text / protocol messages ------------------------------
             elif pkt_type == USRP_TYPE_TEXT:
                 if payload[:4] == REG:
@@ -908,7 +1014,7 @@ class USRPCore:
                                 self._fire('audio_level', 0)
                                 last_key = 0
                                 call = name = tg = rxslot = loss = ''
-                                self._rx_audio_buf = bytearray()
+                                self._flush_audio_q()
                                 _rx_seq_first = -1
                             continue
     
@@ -1006,15 +1112,11 @@ class USRPCore:
         Reads audio from the microphone and transmits USRP voice packets
         when PTT is active.  Also handles VOX detection.
         """
-        CHUNK    = 160 if SAMPLE_RATE == 8000 else 960
         tx_state = None   # audioop resample state
         vox_decay = 0     # VOX hold-off counter (fixed uninitialized-var bug)
 
         try:
-            in_stream = self._pyaudio.open(
-                format=pyaudio.paInt16, channels=1, rate=SAMPLE_RATE,
-                input=True, frames_per_buffer=CHUNK,
-                input_device_index=self.cfg.in_index)
+            in_stream, in_rate, CHUNK = self._open_in_stream()
         except Exception as exc:
             logging.critical("Cannot open input audio stream: %s", exc)
             self._fire('error', "Input audio stream open error")
@@ -1024,13 +1126,20 @@ class USRPCore:
 
         while not self._done:
             try:
-                if SAMPLE_RATE == 48000:
-                    raw48, tx_state = audioop.ratecv(
-                        in_stream.read(CHUNK, exception_on_overflow=False),
-                        2, 1, 48000, 8000, tx_state)
-                    audio = raw48
+                raw = in_stream.read(CHUNK, exception_on_overflow=False)
+
+                # Reposo total (sin PTT, sin VOX, sin flanco pendiente):
+                # drenar el micro sin remuestrear ni calcular nada.
+                # Evita contención de GIL con el hilo de reproducción durante RX.
+                if not self._ptt and not self.vox_enable and not last_ptt:
+                    tx_state = None      # invalidar estado de ratecv
+                    continue
+
+                if in_rate != 8000:
+                    audio, tx_state = audioop.ratecv(
+                        raw, 2, 1, in_rate, 8000, tx_state)
                 else:
-                    audio = in_stream.read(CHUNK, exception_on_overflow=False)
+                    audio = raw
 
                 rms = audioop.rms(audio, 2)
 

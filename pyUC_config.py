@@ -137,6 +137,7 @@ class AppConfig:
     # ── Audio ─────────────────────────────────────────────────────────────────
     in_index:             Optional[int] = None   # None = system default, -1 = disabled
     out_index:            Optional[int] = None
+    native_8k:            bool  = True   # abrir streams a 8 kHz (ALSA plughw remuestrea); fallback a 48 kHz
     mic_vol:              int   = 50
     spk_vol:              int   = 50
     vox_enable:           bool  = False
@@ -171,6 +172,7 @@ class AppConfig:
     show_own_data:        bool  = True    # show operator's own data at startup
     own_data_timeout:     int   = 30     # seconds after last RX to revert (0 = never)
     fullscreen:           bool  = False  # start in fullscreen / kiosk mode
+    keypad_enable:        bool  = True   # show numeric keypad popup on TG entry click
 
     # ── GPIO (Raspberry Pi) ───────────────────────────────────────────────────
     gpio_ptt_pin:         int   = -1      # -1 = disabled
@@ -277,6 +279,7 @@ def load_config(path: str) -> AppConfig:
         # Audio
         cfg.in_index      = _g(cp, D, "in_index",  None, int)
         cfg.out_index     = _g(cp, D, "out_index", None, int)
+        cfg.native_8k     = bool(_g(cp, D, "native8k", 1, int))
         cfg.mic_vol       = _g(cp, D, "micVol",    50,   int)
         cfg.spk_vol       = _g(cp, D, "spkVol",    50,   int)
         cfg.vox_enable    = bool(_g(cp, D, "voxEnable",    0, int))
@@ -315,6 +318,7 @@ def load_config(path: str) -> AppConfig:
         cfg.show_own_data    = bool(_g(cp, D, "showOwnData",    1, int))
         cfg.own_data_timeout = _g(cp, D, "ownDataTimeout", 30, int)
         cfg.fullscreen       = bool(_g(cp, D, "fullscreen",     0, int))
+        cfg.keypad_enable    = bool(_g(cp, D, "keypadEnable",   1, int))
 
         # GPIO
         cfg.gpio_ptt_pin      = _g(cp, D, "gpioPttPin",       -1, int)
@@ -413,6 +417,7 @@ def save_config(path: str, cfg: AppConfig) -> bool:
             "slot":              str(cfg.slot),
             "micVol":            str(cfg.mic_vol),
             "spkVol":            str(cfg.spk_vol),
+            "native8k":          "1" if cfg.native_8k else "0",
             "voxEnable":         "1" if cfg.vox_enable else "0",
             "voxThreshold":      str(cfg.vox_threshold),
             "voxDelay":          str(cfg.vox_delay),
@@ -429,6 +434,7 @@ def save_config(path: str, cfg: AppConfig) -> bool:
             "showOwnData":       "1" if cfg.show_own_data else "0",
             "ownDataTimeout":    str(cfg.own_data_timeout),
             "fullscreen":        "1" if cfg.fullscreen else "0",
+            "keypadEnable":      "1" if cfg.keypad_enable else "0",
         }
         for k, v in fields.items():
             cp.set(D, k, v)

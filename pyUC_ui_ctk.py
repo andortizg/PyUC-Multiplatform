@@ -267,7 +267,9 @@ class CtkUI(UIAdapter):
         self._status_lbl = self._tgconn_lbl = None
         self.on_air_lbl  = None
         self._v_manual_tg = None   # populated by _mk_right
-        self._v_gp        = None   # 'G' | 'P'
+        self._v_private   = None   # IntVar 1=private 0=group (DMR)
+        self._tg_entry_w  = None   # CTkEntry widget ref para posicionar keypad
+        self._kpad        = None   # Toplevel del keypad activo (o None)
 
         # HamQTH vars — used in settings
         self._v_ham_user      = StringVar(value=cfg.ham_user)
@@ -627,7 +629,7 @@ class CtkUI(UIAdapter):
         me = Frame(col, bg=T.bgColor)
         me.pack(fill=X, pady=(3, 0))
         self._v_manual_tg = StringVar()
-        ctk.CTkEntry(
+        self._tg_entry_w = ctk.CTkEntry(
                     me,
                     textvariable=self._v_manual_tg,
                     placeholder_text='TG / Reflector',
@@ -637,23 +639,27 @@ class CtkUI(UIAdapter):
                     border_width=1,
                     font=(None, L.f_sm),
                     height=26,
-                    width=100  # 
-                ).pack(side=LEFT, padx=(0, 1))
-        # G/P dropdown — only meaningful in DMR, right-aligned
-        self._v_gp = StringVar(value='G')
-        ctk.CTkOptionMenu(me,
-                          variable=self._v_gp,
-                          values=['G', 'P'],
-                          fg_color=T.buttonBgColor,
-                          text_color=T.textPrimary,
-                          button_color=T.buttonBgColor,
-                          button_hover_color=T.tgSelectedBg,
-                          dropdown_fg_color=T.surfaceColor,
-                          dropdown_text_color=T.textPrimary,
-                          font=(None, L.f_sm, 'bold'),
-                          dropdown_font=(None, L.f_sm),
-                          width=52, height=26,
-                          ).pack(side=RIGHT)
+                    width=100,
+                )
+        self._tg_entry_w.pack(side=LEFT, padx=(0, 1))
+        self._tg_entry_w.bind(
+            '<Button-1>',
+            lambda e: self._open_keypad() if getattr(self.cfg, 'keypad_enable', True) else None,
+            add='+',
+        )
+        # Private call checkbox — only meaningful in DMR, right-aligned
+        self._v_private = IntVar(value=0)
+        ctk.CTkCheckBox(me,
+                        text='Priv',
+                        variable=self._v_private,
+                        font=(None, L.f_sm),
+                        text_color=T.textSecondary,
+                        fg_color=T.accentColor,
+                        checkmark_color=T.bgColor,
+                        border_color=T.borderColor,
+                        hover_color=T.tgSelectedBg,
+                        checkbox_width=18, checkbox_height=18,
+                        ).pack(side=RIGHT)
 
         # ── CONNECT button ────────────────────────────────────────────────────
         br = Frame(col, bg=T.bgColor)
@@ -752,6 +758,7 @@ class CtkUI(UIAdapter):
         sv['gpio']     = StringVar(value=str(self.cfg.gpio_ptt_pin))
         sv['gpio_al']  = IntVar(value=int(self.cfg.gpio_ptt_active_low))
         sv['spc']      = IntVar(value=int(self.cfg.spacebar_ptt))
+        sv['keypad']   = IntVar(value=int(getattr(self.cfg, 'keypad_enable', True)))
         sv['mic']      = self.v_mic_vol
         sv['spk']      = self.v_spk_vol
         sv['ham_user'] = self._v_ham_user
@@ -933,6 +940,7 @@ class CtkUI(UIAdapter):
         chk(g, 'Active low (pull-up resistor)', sv['gpio_al'], 3, c=0, span=2)
         row(g, 'HamQTH pass',          sv['ham_pass'],3, 2, w=12)
         chk(g, 'Spacebar toggles PTT', sv['spc'],     4, c=0, span=2)
+        chk(g, 'Numeric keypad on TG click', sv['keypad'], 5, c=0, span=2)
         self._set_frms['gpio'] = pg
 
         # ── Sub-page: PI-STAR ─────────────────────────────────────────────────
@@ -1495,10 +1503,12 @@ class CtkUI(UIAdapter):
     # ══════════════════════════════════════════════════════════════════════════
     def _meter(self, cv, pct: float, color: str):
         """
-        Draws a filled bar on a Canvas meter widget.
-        :param cv:    Canvas widget (or None)
-        :param pct:   fill percentage 0–100
-        :param color: bar fill color
+        Dibuja una barra de nivel en un Canvas, reutilizando un único rectángulo
+        persistente (coords) en lugar de borrar y recrear en cada ciclo.
+        :param cv:    widget Canvas (o None)
+        :param pct:   porcentaje de llenado 0–100
+        :param color: color de la barra (hex)
+        No devuelve nada.
         """
         if not cv:
             return
@@ -1507,12 +1517,29 @@ class CtkUI(UIAdapter):
             w = cv.winfo_width()
             if w > 1:
                 cv._cached_w = w
-        h = cv.winfo_height()
-        cv.delete('all')
-        if w > 1:
-            fw = int(w * min(pct, 100) / 100)
-            if fw > 0:
-                cv.create_rectangle(0, 0, fw, h, fill=color, outline='')
+            else:
+                return
+        h = getattr(cv, '_cached_h', 0)
+        if h < 2:
+            h = cv.winfo_height()
+            if h > 1:
+                cv._cached_h = h
+            else:
+                return
+
+        fw = int(w * min(pct, 100) / 100)
+        # Salir si nada cambió respecto al último frame pintado
+        if getattr(cv, '_last_fw', -1) == fw and getattr(cv, '_last_col', None) == color:
+            return
+        cv._last_fw  = fw
+        cv._last_col = color
+
+        rect = getattr(cv, '_bar_id', None)
+        if rect is None:
+            cv._bar_id = cv.create_rectangle(0, 0, fw, h, fill=color, outline='')
+        else:
+            cv.itemconfigure(rect, fill=color)
+            cv.coords(rect, 0, 0, fw, h)
 
     # ══════════════════════════════════════════════════════════════════════════
     # TG list helpers
@@ -1605,6 +1632,146 @@ class CtkUI(UIAdapter):
     # ══════════════════════════════════════════════════════════════════════════
     # Connect / PTT
     # ══════════════════════════════════════════════════════════════════════════
+    def _open_keypad(self):
+        """
+        Opens (or closes if already open) a walkie-talkie style numeric keypad
+        as a Toplevel positioned below the TG entry widget.
+        Writes digits to _v_manual_tg; CALL closes the popup and fires _connect().
+        No params. No return value.
+        """
+        T, L = self.T, self.L
+
+        # Toggle: second click on the entry closes the popup
+        if self._kpad and self._kpad.winfo_exists():
+            self._kpad.destroy()
+            self._kpad = None
+            return
+
+        popup = Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.configure(bg=T.borderColor)   # 1-px border via bg
+        self._kpad = popup
+
+        inner = Frame(popup, bg=T.surfaceColor, padx=2, pady=2)
+        inner.pack(fill=BOTH, expand=True, padx=1, pady=1)
+
+        # ── Display ──────────────────────────────────────────────────────────
+        disp_var = StringVar(value=self._v_manual_tg.get())
+        disp = Entry(
+            inner,
+            textvariable=disp_var,
+            font=(None, L.f + 4, 'bold'),
+            fg=T.accentColor, bg=T.entryBgColor,
+            relief=FLAT, bd=0,
+            highlightthickness=1,
+            highlightbackground=T.borderColor,
+            highlightcolor=T.accentColor,
+            justify=CENTER,
+            width=10,
+        )
+        disp.pack(fill=X, padx=4, pady=(6, 2))
+        disp.focus_set()
+
+        # ── Button grid ──────────────────────────────────────────────────────
+        grid_frm = Frame(inner, bg=T.surfaceColor)
+        grid_frm.pack(fill=BOTH, expand=True, padx=4, pady=2)
+
+        btn_font = (None, L.f + 3, 'bold')
+        PAD = 3
+
+        def _btn(parent, text, fg, bg, cmd, rowspan=1, colspan=1, r=0, c=0):
+            """
+            Creates and grids a Button.
+            parent: container frame
+            text: label
+            fg: foreground color
+            bg: background color
+            cmd: command callback
+            rowspan, colspan: grid span
+            r, c: grid row and column
+            """
+            b = Button(
+                parent, text=text, font=btn_font,
+                fg=fg, bg=bg,
+                activeforeground=T.accentColor,
+                activebackground=T.surface2Color,
+                relief=FLAT, cursor='hand2',
+            )
+            b.grid(row=r, column=c, rowspan=rowspan, columnspan=colspan,
+                   padx=PAD, pady=PAD, sticky=NSEW, ipadx=8, ipady=6)
+            b.configure(command=cmd)
+            return b
+
+        def press(ch):
+            disp_var.set(disp_var.get() + ch)
+
+        def backspace():
+            disp_var.set(disp_var.get()[:-1])
+
+        def clear():
+            disp_var.set('')
+
+        def call():
+            self._v_manual_tg.set(disp_var.get())
+            _close()
+            self._connect()
+
+        def _close():
+            self._kpad = None
+            popup.destroy()
+
+        # Digits 1-9, *, 0, #
+        keys = [('1','2','3'), ('4','5','6'), ('7','8','9'), ('*','0','#')]
+        for ri, row in enumerate(keys):
+            for ci, ch in enumerate(row):
+                _btn(grid_frm, ch, T.textPrimary, T.buttonBgColor,
+                     lambda c=ch: press(c), r=ri, c=ci)
+
+        # ⌫ (2 cols) and CLR (1 col)
+        _btn(grid_frm, '⌫', T.warnColor,  T.buttonBgColor, backspace, r=4, c=0, colspan=2)
+        _btn(grid_frm, 'ESC', T.redColor, T.buttonBgColor, _close,    r=4, c=2)
+
+        for col in range(3):
+            grid_frm.columnconfigure(col, weight=1)
+        for row in range(5):
+            grid_frm.rowconfigure(row, weight=1)
+
+        # ── CALL button ───────────────────────────────────────────────────────
+        Button(
+            inner, text='CALL', font=(None, L.f + 3, 'bold'),
+            fg=T.bgColor, bg=T.accentColor,
+            activeforeground=T.bgColor, activebackground=T.greenColor,
+            relief=FLAT, cursor='hand2',
+            command=call,
+        ).pack(fill=X, padx=4, pady=(2, 6), ipady=6)
+
+        # ── Keyboard shortcuts ────────────────────────────────────────────────
+        popup.bind('<Return>',    lambda e: call())
+        popup.bind('<Escape>',    lambda e: _close())
+        popup.bind('<BackSpace>',  lambda e: backspace())
+        for ch in '0123456789*#':
+            popup.bind(ch, lambda e, c=ch: press(c))
+
+        # ── Positioning: below the TG entry, clamped to screen ───────────────
+        popup.update_idletasks()
+        ew = self._tg_entry_w
+        if ew and ew.winfo_exists():
+            ex = ew.winfo_rootx()
+            ey = ew.winfo_rooty() + ew.winfo_height() + 2
+        else:
+            ex = self.root.winfo_rootx() + 20
+            ey = self.root.winfo_rooty() + 100
+
+        pw = popup.winfo_reqwidth()
+        ph = popup.winfo_reqheight()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        ex = min(ex, sw - pw - 4)
+        ey = min(ey, sh - ph - 4)
+
+        popup.geometry(f'{pw}x{ph}+{ex}+{ey}')
+        popup.grab_set()
+
     def _connect(self):
         """
         Connect to a talk group.
@@ -1623,7 +1790,7 @@ class CtkUI(UIAdapter):
     
         # Añadir sufijo '#' para llamadas privadas DMR
         if dial and not dial.startswith('*'):
-            if (self._v_gp and self._v_gp.get() == 'P'
+            if (self._v_private and self._v_private.get()
                     and self.v_mode.get() == 'DMR'
                     and not dial.endswith('#')):
                 dial = dial + '#'
@@ -1762,6 +1929,7 @@ class CtkUI(UIAdapter):
         self.cfg.ip_address          = sv['ip'].get().strip()
         self.cfg.my_call             = sv['call'].get().strip().upper()
         self.cfg.spacebar_ptt        = bool(sv['spc'].get())
+        self.cfg.keypad_enable       = bool(sv['keypad'].get())
         self.cfg.gpio_ptt_pin        = int(sv['gpio'].get())
         self.cfg.gpio_ptt_active_low = bool(sv['gpio_al'].get())
         if hasattr(self.cfg, 'rx_agc_enable'):
